@@ -325,6 +325,24 @@ def download_and_extract_zip(url: str, target_dir: Path) -> None:
             archive_path.unlink()
 
 
+def zip_sqlite_file(sqlite_path: Path) -> Path:
+    zip_path = sqlite_path.with_suffix(f"{sqlite_path.suffix}.zip")
+
+    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(sqlite_path, arcname=sqlite_path.name)
+
+    LOGGER.info("Created SQLite archive: %s", zip_path)
+    return zip_path
+
+
+def cleanup_extracted_folder(target_dir: Path) -> None:
+    if not target_dir.exists():
+        return
+
+    shutil.rmtree(target_dir)
+    LOGGER.info("Removed extracted GTFS folder: %s", target_dir)
+
+
 def count_csv_rows(file_path: Path) -> int:
     with file_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.reader(handle)
@@ -594,6 +612,11 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Logging verbosity.",
     )
+    parser.add_argument(
+        "--cleanup-extracted",
+        action="store_true",
+        help="Delete the extracted GTFS folder after a successful run when data was downloaded.",
+    )
     return parser.parse_args()
 
 
@@ -732,10 +755,24 @@ def main() -> int:
         LOGGER.error("Database validation failed: %s", error)
         return 1
 
+    try:
+        zip_path = zip_sqlite_file(output_path)
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        LOGGER.error("Failed to create SQLite archive: %s", error)
+        return 1
+
+    if should_download and args.cleanup_extracted:
+        try:
+            cleanup_extracted_folder(input_path)
+        except OSError as error:
+            LOGGER.error("Failed to clean up extracted GTFS folder: %s", error)
+            return 1
+
     LOGGER.info(
         "SQLite schema, data, metadata, and indexes initialized successfully: %s",
         output_path,
     )
+    LOGGER.info("SQLite archive is available at: %s", zip_path)
     LOGGER.info(
         "Successfully validated %d tables and %d total rows.",
         validated_tables,
