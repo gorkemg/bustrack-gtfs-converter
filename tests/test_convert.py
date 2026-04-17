@@ -15,6 +15,67 @@ from scripts import convert
 
 
 class ConvertTests(unittest.TestCase):
+    def test_extract_feed_date_range_prefers_feed_info(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_dir = Path(temp_dir)
+            (input_dir / "feed_info.txt").write_text(
+                "feed_publisher_name,feed_start_date,feed_end_date\nAgency,20260101,20261231\n",
+                encoding="utf-8",
+            )
+            (input_dir / "calendar.txt").write_text(
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+                "WK,1,1,1,1,1,0,0,20250101,20251231\n",
+                encoding="utf-8",
+            )
+
+            feed_start_date, feed_end_date = convert.extract_feed_date_range(input_dir)
+
+            self.assertEqual(feed_start_date, "20260101")
+            self.assertEqual(feed_end_date, "20261231")
+
+    def test_extract_feed_date_range_falls_back_to_calendar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_dir = Path(temp_dir)
+            (input_dir / "calendar.txt").write_text(
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+                "WK,1,1,1,1,1,0,0,20250101,20251231\n",
+                encoding="utf-8",
+            )
+
+            feed_start_date, feed_end_date = convert.extract_feed_date_range(input_dir)
+
+            self.assertEqual(feed_start_date, "20250101")
+            self.assertEqual(feed_end_date, "20251231")
+
+    def test_create_app_metadata_includes_validation_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_dir = Path(temp_dir) / "pvta"
+            input_dir.mkdir()
+            (input_dir / "calendar.txt").write_text(
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+                "WK,1,1,1,1,1,0,0,20250101,20251231\n",
+                encoding="utf-8",
+            )
+
+            connection = sqlite3.connect(":memory:")
+            try:
+                with patch.dict(
+                    "os.environ",
+                    {"GITHUB_SHA": "abc123", "GITHUB_RUN_ID": "987654"},
+                    clear=False,
+                ):
+                    convert.create_app_metadata(connection, input_dir, "pvta")
+
+                rows = dict(connection.execute("SELECT key, value FROM app_metadata").fetchall())
+            finally:
+                connection.close()
+
+            self.assertEqual(rows["agency_id"], "pvta")
+            self.assertEqual(rows["git_commit_sha"], "abc123")
+            self.assertEqual(rows["workflow_run_id"], "987654")
+            self.assertEqual(rows["feed_start_date"], "20250101")
+            self.assertEqual(rows["feed_end_date"], "20251231")
+
     def test_build_http_request_uses_browser_user_agent(self) -> None:
         request = convert.build_http_request("https://example.test/feed.zip")
 

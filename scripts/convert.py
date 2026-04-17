@@ -562,14 +562,55 @@ def import_gtfs_data(connection: sqlite3.Connection, gtfs_files: list[Path]) -> 
         LOGGER.info("Imported %d rows into %s", imported_rows, table_name)
 
 
+def read_first_csv_row(file_path: Path) -> dict[str, str] | None:
+    if not file_path.exists():
+        return None
+
+    with file_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        first_row = next(reader, None)
+
+    if first_row is None:
+        return None
+
+    return {str(key): value or "" for key, value in first_row.items() if key is not None}
+
+
+def extract_feed_date_range(input_path: Path) -> tuple[str, str]:
+    feed_info_row = read_first_csv_row(input_path / "feed_info.txt")
+    if feed_info_row is not None:
+        feed_start_date = feed_info_row.get("feed_start_date", "").strip()
+        feed_end_date = feed_info_row.get("feed_end_date", "").strip()
+        if feed_start_date and feed_end_date:
+            return feed_start_date, feed_end_date
+
+    calendar_row = read_first_csv_row(input_path / "calendar.txt")
+    if calendar_row is not None:
+        feed_start_date = calendar_row.get("start_date", "").strip()
+        feed_end_date = calendar_row.get("end_date", "").strip()
+        if feed_start_date and feed_end_date:
+            return feed_start_date, feed_end_date
+
+    return "", ""
+
+
 def create_app_metadata(
-    connection: sqlite3.Connection, input_path: Path, schema_version: str = "1.0"
+    connection: sqlite3.Connection,
+    input_path: Path,
+    agency_id: str,
+    schema_version: str = "1.0",
 ) -> None:
+    feed_start_date, feed_end_date = extract_feed_date_range(input_path)
     metadata_rows = [
         (
             "build_timestamp",
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
         ),
+        ("agency_id", agency_id),
+        ("git_commit_sha", os.environ.get("GITHUB_SHA", "")),
+        ("workflow_run_id", os.environ.get("GITHUB_RUN_ID", "")),
+        ("feed_start_date", feed_start_date),
+        ("feed_end_date", feed_end_date),
         ("gtfs_source_filename", input_path.name),
         ("schema_version", schema_version),
     ]
@@ -778,7 +819,7 @@ def main() -> int:
         return 1
 
     try:
-        create_app_metadata(connection, input_path)
+        create_app_metadata(connection, input_path, args.agency or input_path.name)
     except sqlite3.Error as error:
         LOGGER.error("Failed to create app_metadata: %s", error)
         connection.close()
