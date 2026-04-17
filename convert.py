@@ -1,12 +1,49 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import sqlite3
 from pathlib import Path
 
 
 LOGGER = logging.getLogger("gtfs_converter")
+
+INTEGER_COLUMN_NAMES = {
+    "bikes_allowed",
+    "continuous_drop_off",
+    "continuous_pickup",
+    "direction_id",
+    "drop_off_type",
+    "duration_limit",
+    "duration_limit_type",
+    "exact_times",
+    "exception_type",
+    "fare_media_type",
+    "fare_transfer_type",
+    "location_type",
+    "min_transfer_time",
+    "payment_method",
+    "pickup_type",
+    "route_sort_order",
+    "route_type",
+    "shape_dist_traveled",
+    "stop_sequence",
+    "timepoint",
+    "transfer_count",
+    "transfer_type",
+    "wheelchair_accessible",
+    "wheelchair_boarding",
+}
+
+REAL_COLUMN_NAMES = {
+    "amount",
+    "shape_dist_traveled",
+    "shape_pt_lat",
+    "shape_pt_lon",
+    "stop_lat",
+    "stop_lon",
+}
 
 
 def discover_gtfs_files(input_path: Path) -> list[Path]:
@@ -30,6 +67,66 @@ def connect_sqlite(database_path: Path) -> sqlite3.Connection:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path)
     return connection
+
+
+def quote_identifier(identifier: str) -> str:
+    escaped_identifier = identifier.replace('"', '""')
+    return f'"{escaped_identifier}"'
+
+
+def infer_sqlite_type(column_name: str) -> str:
+    normalized_name = column_name.strip().lower()
+
+    if normalized_name in REAL_COLUMN_NAMES:
+        return "REAL"
+
+    if normalized_name.endswith(("_lat", "_lon")):
+        return "REAL"
+
+    if normalized_name.endswith(("_sequence", "_sort_order", "_count", "_type")):
+        return "INTEGER"
+
+    if normalized_name in INTEGER_COLUMN_NAMES:
+        return "INTEGER"
+
+    return "TEXT"
+
+
+def read_gtfs_header(file_path: Path) -> list[str]:
+    with file_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle)
+        try:
+            header = next(reader)
+        except StopIteration as error:
+            raise ValueError(f"GTFS file is empty: {file_path}") from error
+
+    if not header:
+        raise ValueError(f"GTFS header is empty: {file_path}")
+
+    return header
+
+
+def build_create_table_sql(table_name: str, columns: list[str]) -> str:
+    column_definitions = [
+        f"{quote_identifier(column_name)} {infer_sqlite_type(column_name)}"
+        for column_name in columns
+    ]
+    joined_columns = ", ".join(column_definitions)
+    return (
+        f"CREATE TABLE {quote_identifier(table_name)} ({joined_columns})"
+    )
+
+
+def create_gtfs_tables(connection: sqlite3.Connection, gtfs_files: list[Path]) -> None:
+    with connection:
+        for gtfs_file in gtfs_files:
+            table_name = gtfs_file.stem
+            columns = read_gtfs_header(gtfs_file)
+            connection.execute(f"DROP TABLE IF EXISTS {quote_identifier(table_name)}")
+            connection.execute(build_create_table_sql(table_name, columns))
+            LOGGER.info(
+                "Created table %s with %d columns", table_name, len(columns)
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,8 +192,15 @@ def main() -> int:
         LOGGER.error("Failed to connect to SQLite database %s: %s", output_path, error)
         return 1
 
+    try:
+        create_gtfs_tables(connection, gtfs_files)
+    except (OSError, ValueError, sqlite3.Error) as error:
+        LOGGER.error("Failed to create GTFS tables: %s", error)
+        connection.close()
+        return 1
+
     connection.close()
-    LOGGER.info("SQLite connection initialized successfully: %s", output_path)
+    LOGGER.info("SQLite schema initialized successfully: %s", output_path)
     return 0
 
 
