@@ -1,0 +1,66 @@
+name: GTFS Sync & Release
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: gtfs-sync-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        agency: [pvta, uta]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Test Suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Run Converter
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python scripts/convert.py --agency ${{ matrix.agency }} --cleanup-extracted
+
+      - name: Check if SQLite archive was created
+        id: check_file
+        run: |
+          if [ -f "data/${{ matrix.agency }}.sqlite.zip" ]; then
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or Update GitHub Release
+        if: steps.check_file.outputs.created == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ matrix.agency }}
+          name: Latest ${{ matrix.agency }} Data
+          files: data/${{ matrix.agency }}.sqlite.zip
+          body: |
+            Automated GTFS update for ${{ matrix.agency }}.
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Commit: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          append_body: false
+          generate_release_notes: false
