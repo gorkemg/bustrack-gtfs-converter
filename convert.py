@@ -48,6 +48,16 @@ REAL_COLUMN_NAMES = {
     "stop_lon",
 }
 
+INDEXED_COLUMN_NAMES = {
+    "route_id",
+    "route_long_name",
+    "route_short_name",
+    "stop_id",
+    "stop_name",
+    "trip_headsign",
+    "trip_id",
+}
+
 
 def discover_gtfs_files(input_path: Path) -> list[Path]:
     gtfs_files = sorted(path for path in input_path.iterdir() if path.suffix == ".txt")
@@ -223,6 +233,35 @@ def create_app_metadata(
     LOGGER.info("Created app_metadata with %d entries", len(metadata_rows))
 
 
+def build_index_name(table_name: str, column_name: str) -> str:
+    return f"idx_{table_name}_{column_name}"
+
+
+def create_recommended_indexes(
+    connection: sqlite3.Connection, gtfs_files: list[Path]
+) -> None:
+    created_indexes = 0
+
+    with connection:
+        for gtfs_file in gtfs_files:
+            table_name = gtfs_file.stem
+            columns = read_gtfs_header(gtfs_file)
+
+            for column_name in columns:
+                if column_name not in INDEXED_COLUMN_NAMES:
+                    continue
+
+                index_name = build_index_name(table_name, column_name)
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS "
+                    f"{quote_identifier(index_name)} ON "
+                    f"{quote_identifier(table_name)} ({quote_identifier(column_name)})"
+                )
+                created_indexes += 1
+
+    LOGGER.info("Created %d recommended indexes", created_indexes)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert a GTFS directory into an optimized SQLite database."
@@ -307,9 +346,17 @@ def main() -> int:
         connection.close()
         return 1
 
+    try:
+        create_recommended_indexes(connection, gtfs_files)
+    except (OSError, ValueError, sqlite3.Error) as error:
+        LOGGER.error("Failed to create recommended indexes: %s", error)
+        connection.close()
+        return 1
+
     connection.close()
     LOGGER.info(
-        "SQLite schema, data, and metadata initialized successfully: %s", output_path
+        "SQLite schema, data, metadata, and indexes initialized successfully: %s",
+        output_path,
     )
     return 0
 
