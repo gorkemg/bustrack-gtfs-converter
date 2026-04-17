@@ -9,11 +9,32 @@ from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from scripts import convert
 
 
 class ConvertTests(unittest.TestCase):
+    def test_build_http_request_uses_browser_user_agent(self) -> None:
+        request = convert.build_http_request("https://example.test/feed.zip")
+
+        self.assertEqual(request.get_header("User-agent"), convert.USER_AGENT)
+
+    def test_fetch_latest_release_timestamp_returns_none_for_404(self) -> None:
+        not_found_error = HTTPError(
+            url="https://api.github.com/repos/example/repo/releases?per_page=100",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=None,
+        )
+
+        with patch.dict("os.environ", {"GITHUB_REPOSITORY": "example/repo"}, clear=False):
+            with patch("scripts.convert.urlopen", side_effect=not_found_error):
+                release_timestamp = convert.fetch_latest_release_timestamp_from_github("uta")
+
+        self.assertIsNone(release_timestamp)
+
     def test_download_and_extract_zip_populates_target_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target_dir = Path(temp_dir) / "agency"
@@ -27,6 +48,23 @@ class ConvertTests(unittest.TestCase):
                 convert.download_and_extract_zip("https://example.test/feed.zip", target_dir)
 
             self.assertTrue((target_dir / "stops.txt").exists())
+
+    def test_download_and_extract_zip_flattens_nested_txt_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target_dir = Path(temp_dir) / "agency"
+            archive_bytes = BytesIO()
+            with zipfile.ZipFile(archive_bytes, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("nested/stops.txt", "stop_id,stop_name\n1,Stop A\n")
+                archive.writestr("nested/trips.txt", "route_id,service_id,trip_id\nR1,S1,T1\n")
+
+            archive_bytes.seek(0)
+
+            with patch("scripts.convert.urlopen", return_value=archive_bytes):
+                convert.download_and_extract_zip("https://example.test/feed.zip", target_dir)
+
+            self.assertTrue((target_dir / "stops.txt").exists())
+            self.assertTrue((target_dir / "trips.txt").exists())
+            self.assertFalse((target_dir / "nested").joinpath("stops.txt").exists())
 
     def test_zip_sqlite_file_creates_expected_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -173,6 +211,58 @@ class ConvertTests(unittest.TestCase):
 
             with patch("sys.argv", ["convert.py", str(csv_dir), "--output", str(output_path)]):
                 exit_code = convert.main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(output_path.exists())
+            self.assertTrue(output_path.with_suffix(".sqlite.zip").exists())
+
+    def test_main_forces_download_when_release_check_fails_and_folder_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            input_dir = temp_root / "uta"
+            output_path = temp_root / "uta.sqlite"
+
+            def fake_download(url: str, target_dir: Path) -> None:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                (target_dir / "stops.txt").write_text(
+                    "stop_id,stop_name,stop_lat,stop_lon\n1,Stop A,1.0,2.0\n",
+                    encoding="utf-8",
+                )
+                (target_dir / "trips.txt").write_text(
+                    "route_id,service_id,trip_id,trip_headsign,shape_id\nR1,S1,T1,Headsign,SH1\n",
+                    encoding="utf-8",
+                )
+                (target_dir / "stop_times.txt").write_text(
+                    "trip_id,arrival_time,stop_id,stop_sequence\nT1,08:00:00,1,1\n",
+                    encoding="utf-8",
+                )
+
+            with patch(
+                "scripts.convert.load_agencies_config",
+                return_value=[{"id": "uta", "url": "https://example.test/uta.zip"}],
+            ):
+                with patch(
+                    "scripts.convert.needs_update",
+                    side_effect=HTTPError(
+                        url="https://example.test/uta.zip",
+                        code=406,
+                        msg="Not Acceptable",
+                        hdrs=None,
+                        fp=None,
+                    ),
+                ):
+                    with patch("scripts.convert.download_and_extract_zip", side_effect=fake_download):
+                        with patch(
+                            "sys.argv",
+                            [
+                                "convert.py",
+                                "--agency",
+                                "uta",
+                                "--output",
+                                str(output_path),
+                            ],
+                        ):
+                            exit_code = convert.main()
 
             self.assertEqual(exit_code, 0)
             self.assertTrue(output_path.exists())

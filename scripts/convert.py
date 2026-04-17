@@ -18,6 +18,10 @@ from urllib.request import Request, urlopen
 
 LOGGER = logging.getLogger("gtfs_converter")
 IMPORT_CHUNK_SIZE = 5000
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 INTEGER_COLUMN_NAMES = {
     "bikes_allowed",
@@ -142,13 +146,15 @@ def parse_github_datetime(value: str) -> datetime:
     return parse_iso8601_datetime(normalized_value)
 
 
-def build_http_request(url: str, method: str = "GET") -> Request:
+def build_http_request(url: str, method: str = "GET", github_api: bool = False) -> Request:
     headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "bustrack-gtfs-converter",
+        "User-Agent": USER_AGENT,
     }
+    if github_api:
+        headers["Accept"] = "application/vnd.github+json"
+
     github_token = os.environ.get("GITHUB_TOKEN")
-    if github_token:
+    if github_api and github_token:
         headers["Authorization"] = f"Bearer {github_token}"
 
     return Request(url, headers=headers, method=method)
@@ -172,10 +178,15 @@ def fetch_latest_release_timestamp_from_github(agency_id: str) -> datetime | Non
 
     github_api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
     releases_url = f"{github_api_url}/repos/{repository}/releases?per_page=100"
-    request = build_http_request(releases_url)
+    request = build_http_request(releases_url, github_api=True)
 
-    with urlopen(request, timeout=30) as response:
-        payload = json.load(response)
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = json.load(response)
+    except HTTPError as error:
+        if error.code == 404:
+            return None
+        raise
 
     if not isinstance(payload, list):
         raise ValueError("GitHub releases response must be a JSON list")
@@ -299,6 +310,33 @@ def discover_gtfs_files(input_path: Path) -> list[Path]:
     return gtfs_files
 
 
+def is_folder_empty(folder_path: Path) -> bool:
+    if not folder_path.exists() or not folder_path.is_dir():
+        return True
+
+    return not any(folder_path.iterdir())
+
+
+def flatten_extracted_gtfs_files(target_dir: Path) -> None:
+    direct_txt_files = [path for path in target_dir.iterdir() if path.is_file() and path.suffix == ".txt"]
+    if direct_txt_files:
+        return
+
+    nested_txt_files = [
+        path for path in target_dir.rglob("*.txt") if path.is_file() and path.parent != target_dir
+    ]
+    if not nested_txt_files:
+        return
+
+    for source_path in nested_txt_files:
+        destination_path = target_dir / source_path.name
+        if destination_path.exists() and destination_path != source_path:
+            raise ValueError(
+                f"Duplicate GTFS file encountered while flattening archive: {destination_path.name}"
+            )
+        shutil.move(str(source_path), str(destination_path))
+
+
 def download_and_extract_zip(url: str, target_dir: Path) -> None:
     archive_path = target_dir.parent / f"{target_dir.name}.download.zip"
     request = build_http_request(url)
@@ -316,6 +354,8 @@ def download_and_extract_zip(url: str, target_dir: Path) -> None:
         LOGGER.info("Extracting GTFS archive into %s", target_dir)
         with zipfile.ZipFile(archive_path) as archive:
             archive.extractall(target_dir)
+
+        flatten_extracted_gtfs_files(target_dir)
     except (OSError, URLError, HTTPError, zipfile.BadZipFile) as error:
         if target_dir.exists():
             shutil.rmtree(target_dir, ignore_errors=True)
@@ -663,6 +703,7 @@ def main() -> int:
 
     upstream_last_modified: datetime | None = None
     should_download = False
+    release_check_failed = False
     if args.agency and gtfs_url:
         try:
             should_update, upstream_last_modified = needs_update(args.agency, gtfs_url)
@@ -673,12 +714,24 @@ def main() -> int:
             HTTPError,
             URLError,
         ) as error:
-            LOGGER.warning("Release check failed, continuing with conversion: %s", error)
+            release_check_failed = True
+            LOGGER.warning("Release check failed, evaluating local GTFS availability: %s", error)
         else:
             if not should_update:
-                LOGGER.info("No update needed")
-                return 0
+                if is_folder_empty(input_path):
+                    LOGGER.info("No remote update detected, but local GTFS folder is empty. Forcing download.")
+                    should_download = True
+                else:
+                    LOGGER.info("No update needed")
+                    return 0
             should_download = True
+
+    if gtfs_url and (not input_path.exists() or is_folder_empty(input_path)):
+        if release_check_failed:
+            LOGGER.info("Local GTFS folder is missing or empty after release-check failure. Forcing download.")
+        elif not should_download:
+            LOGGER.info("Local GTFS folder is missing or empty. Forcing download.")
+        should_download = True
 
     if should_download:
         try:

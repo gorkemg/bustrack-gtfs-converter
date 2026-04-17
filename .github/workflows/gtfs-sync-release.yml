@@ -5,12 +5,33 @@ on:
     - cron: '0 8 * * *'
   workflow_dispatch:
 
+env:
+  # Fix for the Node.js 20 Deprecation Warnings
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 concurrency:
   group: gtfs-sync-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Test Suite
+        run: python -m unittest discover -s tests -v
+
   sync:
+    needs: tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -29,15 +50,23 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run Test Suite
-        run: python -m unittest discover -s tests -v
-
       - name: Run Converter
+        id: converter
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          python scripts/convert.py --agency ${{ matrix.agency }} --cleanup-extracted
+          mkdir -p logs
+          python scripts/convert.py --agency ${{ matrix.agency }} --cleanup-extracted 2>&1 | tee logs/${{ matrix.agency }}.log
+
+      - name: Upload Converter Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: converter-log-${{ matrix.agency }}
+          path: logs/${{ matrix.agency }}.log
+          if-no-files-found: ignore
 
       - name: Check if SQLite archive was created
         id: check_file
@@ -47,6 +76,14 @@ jobs:
           else
             echo "created=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Upload SQLite Archive Artifact
+        if: steps.check_file.outputs.created == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-archive-${{ matrix.agency }}
+          path: data/${{ matrix.agency }}.sqlite.zip
+          if-no-files-found: error
 
       - name: Create or Update GitHub Release
         if: steps.check_file.outputs.created == 'true'
@@ -64,3 +101,12 @@ jobs:
           make_latest: true
           append_body: false
           generate_release_notes: false
+
+      - name: Report Agency Result
+        if: always()
+        run: |
+          if [ "${{ steps.check_file.outputs.created }}" = "true" ]; then
+            echo "Agency ${{ matrix.agency }} finished successfully and produced a release artifact." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Agency ${{ matrix.agency }} did not produce a release artifact. Check converter-log-${{ matrix.agency }} for details." >> "$GITHUB_STEP_SUMMARY"
+          fi
