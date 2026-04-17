@@ -1,6 +1,9 @@
 name: GTFS Sync & Release
 
 on:
+  push:
+    paths:
+      - config/agencies.json
   schedule:
     - cron: '0 8 * * *'
   workflow_dispatch:
@@ -31,8 +34,32 @@ jobs:
       - name: Run Test Suite
         run: python -m unittest discover -s tests -v
 
+  prepare-agencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      agencies: ${{ steps.agencies.outputs.matrix }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Build Agency Matrix
+        id: agencies
+        run: |
+          matrix=$(python3 -c 'import json, pathlib; payload = json.loads(pathlib.Path("config/agencies.json").read_text(encoding="utf-8")); agencies = [entry["id"] for entry in payload if isinstance(entry, dict) and entry.get("id")]; print(json.dumps(agencies))')
+          if [ "$matrix" = "[]" ]; then
+            echo "No agencies found in config/agencies.json" >&2
+            exit 1
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   sync:
-    needs: tests
+    needs:
+      - tests
+      - prepare-agencies
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -40,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        agency: [pvta, uta]
+        agency: ${{ fromJson(needs.prepare-agencies.outputs.agencies) }}
 
     steps:
       - name: Checkout Repository

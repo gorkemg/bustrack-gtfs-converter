@@ -73,7 +73,9 @@ To integrate a new transit agency, append its configuration to `config/agencies.
 }
 ```
 
-Then update the agency matrix in [gtfs-sync-release.yml](.github/workflows/gtfs-sync-release.yml) and the rollback choices in [rollback.yml](.github/workflows/rollback.yml). The workflows are currently explicit, not dynamically generated from `config/agencies.json`.
+That is sufficient for normal operation. The sync workflow derives its agency matrix directly from `config/agencies.json`, and a push to that file also triggers the workflow.
+
+The rollback workflow also validates the entered agency ID against `config/agencies.json`, so no workflow edits are required when onboarding a new agency.
 
 ## Manual Emergency Rollback
 
@@ -81,7 +83,7 @@ If an upstream GTFS update ships broken data, use the Manual Rollback workflow t
 
 1. Open the Actions tab in GitHub.
 2. Select the `Manual Rollback` workflow.
-3. Choose the affected agency.
+3. Enter the affected agency ID.
 4. Start the workflow manually.
 
 The workflow downloads `${agency}-previous.sqlite.zip` from the `${agency}-previous` release and uploads it back to the `${agency}` production release.
@@ -100,8 +102,8 @@ The pipeline currently validates:
 - `scripts/convert.py`: end-to-end GTFS download, conversion, validation, packaging, and metadata generation
 - `config/agencies.json`: configured agencies and source URLs
 - `data/`: generated runtime artifacts; keep only placeholder files in git
-- `.github/workflows/gtfs-sync-release.yml`: scheduled sync, validation, archive/previous/production publishing
-- `.github/workflows/rollback.yml`: manual rollback from `previous` to `production`
+- `.github/workflows/gtfs-sync-release.yml`: scheduled and config-triggered sync, validation, and archive/previous/production publishing with a dynamic agency matrix
+- `.github/workflows/rollback.yml`: manual rollback from `previous` to `production` with agency validation against `config/agencies.json`
 - `tests/test_convert.py`: standard-library regression tests
 
 # License

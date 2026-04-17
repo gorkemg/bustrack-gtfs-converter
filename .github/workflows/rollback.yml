@@ -4,12 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       agency:
-        description: Choose the Agency for the rollback to the Previous version.
+        description: Enter the agency ID for the rollback to the Previous version.
         required: true
-        type: choice
-        options:
-          - pvta
-          - uta
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -22,6 +18,15 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Validate Agency Input
+        env:
+          AGENCY: ${{ inputs.agency }}
+        run: |
+          python3 -c 'import json, pathlib, sys; agency = sys.argv[1]; payload = json.loads(pathlib.Path("config/agencies.json").read_text(encoding="utf-8")); valid = {entry.get("id") for entry in payload if isinstance(entry, dict)}; raise SystemExit(0 if agency in valid else f"Unknown agency: {agency}")' "$AGENCY"
+
       - name: Download Previous Release Asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
