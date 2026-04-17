@@ -5,6 +5,7 @@ import csv
 import logging
 import sqlite3
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -198,6 +199,30 @@ def import_gtfs_data(connection: sqlite3.Connection, gtfs_files: list[Path]) -> 
         LOGGER.info("Imported %d rows into %s", imported_rows, table_name)
 
 
+def create_app_metadata(
+    connection: sqlite3.Connection, input_path: Path, schema_version: str = "1.0"
+) -> None:
+    metadata_rows = [
+        (
+            "build_timestamp",
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        ),
+        ("gtfs_source_filename", input_path.name),
+        ("schema_version", schema_version),
+    ]
+
+    with connection:
+        connection.execute("DROP TABLE IF EXISTS app_metadata")
+        connection.execute(
+            "CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO app_metadata (key, value) VALUES (?, ?)", metadata_rows
+        )
+
+    LOGGER.info("Created app_metadata with %d entries", len(metadata_rows))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert a GTFS directory into an optimized SQLite database."
@@ -275,8 +300,17 @@ def main() -> int:
         connection.close()
         return 1
 
+    try:
+        create_app_metadata(connection, args.input_path)
+    except sqlite3.Error as error:
+        LOGGER.error("Failed to create app_metadata: %s", error)
+        connection.close()
+        return 1
+
     connection.close()
-    LOGGER.info("SQLite schema and data initialized successfully: %s", output_path)
+    LOGGER.info(
+        "SQLite schema, data, and metadata initialized successfully: %s", output_path
+    )
     return 0
 
 
