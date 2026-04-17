@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import logging
+import os
 import sqlite3
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -134,8 +135,25 @@ def parse_iso8601_datetime(value: str) -> datetime:
     return parsed_value.astimezone(timezone.utc)
 
 
+def parse_github_datetime(value: str) -> datetime:
+    normalized_value = value.replace("Z", "+00:00")
+    return parse_iso8601_datetime(normalized_value)
+
+
+def build_http_request(url: str, method: str = "GET") -> Request:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "bustrack-gtfs-converter",
+    }
+    github_token = os.environ.get("GITHUB_TOKEN")
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+
+    return Request(url, headers=headers, method=method)
+
+
 def fetch_last_modified(gtfs_url: str) -> datetime:
-    request = Request(gtfs_url, method="HEAD")
+    request = build_http_request(gtfs_url, method="HEAD")
     with urlopen(request, timeout=30) as response:
         last_modified = response.headers.get("Last-Modified")
 
@@ -145,19 +163,73 @@ def fetch_last_modified(gtfs_url: str) -> datetime:
     return parse_http_datetime(last_modified)
 
 
-def needs_update(
-    agency_id: str, gtfs_url: str, cache_path: Path | None = None
-) -> tuple[bool, datetime]:
+def fetch_latest_release_timestamp_from_github(agency_id: str) -> datetime | None:
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    if not repository:
+        return None
+
+    github_api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+    releases_url = f"{github_api_url}/repos/{repository}/releases?per_page=100"
+    request = build_http_request(releases_url)
+
+    with urlopen(request, timeout=30) as response:
+        payload = json.load(response)
+
+    if not isinstance(payload, list):
+        raise ValueError("GitHub releases response must be a JSON list")
+
+    matching_timestamps: list[datetime] = []
+    for release in payload:
+        if not isinstance(release, dict):
+            continue
+
+        tag_name = str(release.get("tag_name", ""))
+        release_name = str(release.get("name", ""))
+        if not (
+            tag_name == agency_id
+            or tag_name.startswith(f"{agency_id}-")
+            or release_name == agency_id
+            or release_name.startswith(f"{agency_id}-")
+        ):
+            continue
+
+        published_at = release.get("published_at") or release.get("created_at")
+        if not published_at:
+            continue
+
+        matching_timestamps.append(parse_github_datetime(str(published_at)))
+
+    if not matching_timestamps:
+        return None
+
+    return max(matching_timestamps)
+
+
+def get_last_successful_release_timestamp(
+    agency_id: str, cache_path: Path | None = None
+) -> datetime | None:
+    github_release_timestamp = fetch_latest_release_timestamp_from_github(agency_id)
+    if github_release_timestamp is not None:
+        return github_release_timestamp
+
     effective_cache_path = cache_path or get_release_cache_path()
-    upstream_last_modified = fetch_last_modified(gtfs_url)
     release_cache = load_release_cache(effective_cache_path)
     cached_release = release_cache.get(agency_id, {})
     cached_release_date = cached_release.get("released_at")
-
     if not cached_release_date:
+        return None
+
+    return parse_iso8601_datetime(cached_release_date)
+
+
+def needs_update(
+    agency_id: str, gtfs_url: str, cache_path: Path | None = None
+) -> tuple[bool, datetime]:
+    upstream_last_modified = fetch_last_modified(gtfs_url)
+    last_release_date = get_last_successful_release_timestamp(agency_id, cache_path)
+    if last_release_date is None:
         return True, upstream_last_modified
 
-    last_release_date = parse_iso8601_datetime(cached_release_date)
     return upstream_last_modified > last_release_date, upstream_last_modified
 
 
@@ -225,6 +297,56 @@ def discover_gtfs_files(input_path: Path) -> list[Path]:
         raise FileNotFoundError(f"No GTFS .txt files found in {input_path}")
 
     return gtfs_files
+
+
+def count_csv_rows(file_path: Path) -> int:
+    with file_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle)
+        next(reader, None)
+        return sum(1 for _ in reader)
+
+
+def count_table_rows(connection: sqlite3.Connection, table_name: str) -> int:
+    result = connection.execute(
+        f"SELECT COUNT(*) FROM {quote_identifier(table_name)}"
+    ).fetchone()
+    if result is None:
+        raise ValueError(f"Failed to count rows for table {table_name}")
+    return int(result[0])
+
+
+def validate_database(sqlite_path: Path, csv_folder: Path) -> tuple[int, int]:
+    gtfs_files = discover_gtfs_files(csv_folder)
+    validated_tables = 0
+    total_rows = 0
+    sanity_tables = {"stops", "trips", "stop_times"}
+
+    connection = sqlite3.connect(sqlite_path)
+    try:
+        for gtfs_file in gtfs_files:
+            table_name = gtfs_file.stem
+            csv_row_count = count_csv_rows(gtfs_file)
+            table_row_count = count_table_rows(connection, table_name)
+
+            if table_row_count != csv_row_count:
+                LOGGER.error(
+                    "Validation failed for %s: SQLite has %d rows, CSV has %d rows",
+                    table_name,
+                    table_row_count,
+                    csv_row_count,
+                )
+                raise SystemExit(1)
+
+            if table_name in sanity_tables and table_row_count == 0:
+                LOGGER.error("Sanity check failed: %s contains 0 rows", table_name)
+                raise SystemExit(1)
+
+            validated_tables += 1
+            total_rows += table_row_count
+    finally:
+        connection.close()
+
+    return validated_tables, total_rows
 
 
 def connect_sqlite(database_path: Path) -> sqlite3.Connection:
@@ -567,9 +689,22 @@ def main() -> int:
             LOGGER.error("Failed to update release cache: %s", error)
             return 1
 
+    try:
+        validated_tables, total_rows = validate_database(output_path, input_path)
+    except (FileNotFoundError, OSError, ValueError, sqlite3.Error, SystemExit) as error:
+        if isinstance(error, SystemExit):
+            raise
+        LOGGER.error("Database validation failed: %s", error)
+        return 1
+
     LOGGER.info(
         "SQLite schema, data, metadata, and indexes initialized successfully: %s",
         output_path,
+    )
+    LOGGER.info(
+        "Successfully validated %d tables and %d total rows.",
+        validated_tables,
+        total_rows,
     )
     return 0
 
