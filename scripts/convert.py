@@ -5,7 +5,9 @@ import csv
 import json
 import logging
 import os
+import shutil
 import sqlite3
+import zipfile
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -270,9 +272,7 @@ def resolve_input_path(input_path: Path | None, agency_id: str | None) -> Path:
         if candidate_path.exists() and candidate_path.is_dir():
             return candidate_path
 
-    raise FileNotFoundError(
-        f"No GTFS directory found for agency '{agency_id}' in data/ or repository root"
-    )
+    return repo_root / "data" / agency_id
 
 
 def resolve_output_path(
@@ -297,6 +297,32 @@ def discover_gtfs_files(input_path: Path) -> list[Path]:
         raise FileNotFoundError(f"No GTFS .txt files found in {input_path}")
 
     return gtfs_files
+
+
+def download_and_extract_zip(url: str, target_dir: Path) -> None:
+    archive_path = target_dir.parent / f"{target_dir.name}.download.zip"
+    request = build_http_request(url)
+
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        LOGGER.info("Downloading GTFS archive from %s", url)
+        with urlopen(request, timeout=120) as response, archive_path.open("wb") as handle:
+            shutil.copyfileobj(response, handle)
+
+        LOGGER.info("Extracting GTFS archive into %s", target_dir)
+        with zipfile.ZipFile(archive_path) as archive:
+            archive.extractall(target_dir)
+    except (OSError, URLError, HTTPError, zipfile.BadZipFile) as error:
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        raise ValueError(f"Failed to download or extract GTFS archive: {error}") from error
+    finally:
+        if archive_path.exists():
+            archive_path.unlink()
 
 
 def count_csv_rows(file_path: Path) -> int:
@@ -613,6 +639,7 @@ def main() -> int:
         LOGGER.info("GTFS URL: %s", gtfs_url)
 
     upstream_last_modified: datetime | None = None
+    should_download = False
     if args.agency and gtfs_url:
         try:
             should_update, upstream_last_modified = needs_update(args.agency, gtfs_url)
@@ -628,6 +655,14 @@ def main() -> int:
             if not should_update:
                 LOGGER.info("No update needed")
                 return 0
+            should_download = True
+
+    if should_download:
+        try:
+            download_and_extract_zip(gtfs_url, input_path)
+        except ValueError as error:
+            LOGGER.error("%s", error)
+            return 1
 
     if not input_path.exists():
         LOGGER.error("Input path does not exist: %s", input_path)
