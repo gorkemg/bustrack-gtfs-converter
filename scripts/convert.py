@@ -125,9 +125,7 @@ def build_create_table_sql(table_name: str, columns: list[str]) -> str:
         for column_name in columns
     ]
     joined_columns = ", ".join(column_definitions)
-    return (
-        f"CREATE TABLE {quote_identifier(table_name)} ({joined_columns})"
-    )
+    return f"CREATE TABLE {quote_identifier(table_name)} ({joined_columns})"
 
 
 def build_insert_sql(table_name: str, columns: list[str]) -> str:
@@ -189,9 +187,7 @@ def create_gtfs_tables(connection: sqlite3.Connection, gtfs_files: list[Path]) -
             columns = read_gtfs_header(gtfs_file)
             connection.execute(f"DROP TABLE IF EXISTS {quote_identifier(table_name)}")
             connection.execute(build_create_table_sql(table_name, columns))
-            LOGGER.info(
-                "Created table %s with %d columns", table_name, len(columns)
-            )
+            LOGGER.info("Created table %s with %d columns", table_name, len(columns))
 
 
 def import_gtfs_data(connection: sqlite3.Connection, gtfs_files: list[Path]) -> None:
