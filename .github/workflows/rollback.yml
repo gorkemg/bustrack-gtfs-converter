@@ -1,0 +1,52 @@
+name: Manual Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      agency:
+        description: Choose the Agency for the rollback to the Previous version.
+        required: true
+        type: choice
+        options:
+          - pvta
+          - uta
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Previous Release Asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENCY: ${{ inputs.agency }}
+        run: |
+          mkdir -p rollback
+          gh release download "${AGENCY}-previous" \
+            --repo "${{ github.repository }}" \
+            --pattern "${AGENCY}-previous.sqlite.zip" \
+            --dir rollback \
+            --clobber
+          cp "rollback/${AGENCY}-previous.sqlite.zip" "rollback/${AGENCY}.sqlite.zip"
+
+      - name: Restore Production Release Asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENCY: ${{ inputs.agency }}
+        run: |
+          gh release upload "${AGENCY}" \
+            "rollback/${AGENCY}.sqlite.zip" \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+      - name: Report Rollback Result
+        env:
+          AGENCY: ${{ inputs.agency }}
+        run: |
+          echo "Rolled back ${AGENCY} production release from the ${AGENCY}-previous asset." >> "$GITHUB_STEP_SUMMARY"

@@ -160,7 +160,7 @@ jobs:
             Commit: ${{ github.sha }}
           draft: false
           prerelease: false
-          make_latest: true
+          make_latest: false
           append_body: false
           generate_release_notes: false
 
