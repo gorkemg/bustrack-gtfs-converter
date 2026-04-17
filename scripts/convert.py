@@ -52,14 +52,29 @@ REAL_COLUMN_NAMES = {
     "stop_lon",
 }
 
-INDEXED_COLUMN_NAMES = {
-    "route_id",
-    "route_long_name",
-    "route_short_name",
-    "stop_id",
-    "stop_name",
-    "trip_headsign",
-    "trip_id",
+INDEX_SPECS = {
+    "stop_times": [
+        ("trip_id",),
+        ("stop_id", "arrival_time"),
+        ("stop_sequence",),
+    ],
+    "trips": [
+        ("service_id", "route_id"),
+        ("trip_headsign",),
+        ("shape_id",),
+    ],
+    "calendar": [
+        ("service_id", "start_date", "end_date"),
+    ],
+    "calendar_dates": [
+        ("service_id", "date"),
+    ],
+    "shapes": [
+        ("shape_id",),
+    ],
+    "stops": [
+        ("stop_id", "stop_lat", "stop_lon"),
+    ],
 }
 
 
@@ -365,8 +380,8 @@ def create_app_metadata(
     LOGGER.info("Created app_metadata with %d entries", len(metadata_rows))
 
 
-def build_index_name(table_name: str, column_name: str) -> str:
-    return f"idx_{table_name}_{column_name}"
+def build_index_name(table_name: str, columns: tuple[str, ...]) -> str:
+    return f"idx_{table_name}_{'_'.join(columns)}"
 
 
 def create_recommended_indexes(
@@ -377,17 +392,24 @@ def create_recommended_indexes(
     with connection:
         for gtfs_file in gtfs_files:
             table_name = gtfs_file.stem
-            columns = read_gtfs_header(gtfs_file)
-
-            for column_name in columns:
-                if column_name not in INDEXED_COLUMN_NAMES:
+            available_columns = set(read_gtfs_header(gtfs_file))
+            for index_columns in INDEX_SPECS.get(table_name, []):
+                if not set(index_columns).issubset(available_columns):
+                    LOGGER.warning(
+                        "Skipping index for %s on %s because required columns are missing",
+                        table_name,
+                        index_columns,
+                    )
                     continue
 
-                index_name = build_index_name(table_name, column_name)
+                index_name = build_index_name(table_name, index_columns)
+                quoted_columns = ", ".join(
+                    quote_identifier(column_name) for column_name in index_columns
+                )
                 connection.execute(
                     "CREATE INDEX IF NOT EXISTS "
                     f"{quote_identifier(index_name)} ON "
-                    f"{quote_identifier(table_name)} ({quote_identifier(column_name)})"
+                    f"{quote_identifier(table_name)} ({quoted_columns})"
                 )
                 created_indexes += 1
 
