@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import sqlite3
 from collections.abc import Iterator
@@ -59,6 +60,67 @@ INDEXED_COLUMN_NAMES = {
 }
 
 
+def get_repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def get_agencies_config_path() -> Path:
+    return get_repo_root() / "config" / "agencies.json"
+
+
+def load_agencies_config(config_path: Path) -> list[dict[str, str]]:
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    if not isinstance(config, list):
+        raise ValueError(f"Agency config must be a JSON list: {config_path}")
+
+    return config
+
+
+def resolve_agency_config(
+    agencies_config: list[dict[str, str]], agency_id: str
+) -> dict[str, str]:
+    for agency_config in agencies_config:
+        if agency_config.get("id") == agency_id:
+            return agency_config
+
+    raise ValueError(f"Agency '{agency_id}' not found in agencies config")
+
+
+def resolve_input_path(input_path: Path | None, agency_id: str | None) -> Path:
+    if input_path is not None:
+        return input_path
+
+    if agency_id is None:
+        raise ValueError("Either input_path or --agency must be provided")
+
+    repo_root = get_repo_root()
+    candidate_paths = [repo_root / "data" / agency_id, repo_root / agency_id]
+    for candidate_path in candidate_paths:
+        if candidate_path.exists() and candidate_path.is_dir():
+            return candidate_path
+
+    raise FileNotFoundError(
+        f"No GTFS directory found for agency '{agency_id}' in data/ or repository root"
+    )
+
+
+def resolve_output_path(
+    input_path: Path, agency_id: str | None, output_name: str | None
+) -> Path:
+    repo_root = get_repo_root()
+
+    if output_name:
+        output_path = Path(output_name)
+        if output_path.is_absolute():
+            return output_path
+        return repo_root / output_path
+
+    output_stem = agency_id or input_path.name
+    return repo_root / "data" / f"{output_stem}.sqlite"
+
+
 def discover_gtfs_files(input_path: Path) -> list[Path]:
     gtfs_files = sorted(path for path in input_path.iterdir() if path.suffix == ".txt")
 
@@ -66,14 +128,6 @@ def discover_gtfs_files(input_path: Path) -> list[Path]:
         raise FileNotFoundError(f"No GTFS .txt files found in {input_path}")
 
     return gtfs_files
-
-
-def build_output_path(input_path: Path, output_name: str) -> Path:
-    output_path = Path(output_name)
-    if output_path.is_absolute():
-        return output_path
-
-    return input_path.parent / output_path
 
 
 def connect_sqlite(database_path: Path) -> sqlite3.Connection:
@@ -264,13 +318,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "input_path",
+        nargs="?",
         type=Path,
-        help="Path to the GTFS directory containing .txt files.",
+        help="Optional path to the GTFS directory containing .txt files.",
+    )
+    parser.add_argument(
+        "--agency",
+        help="Agency ID from config/agencies.json, for example pvta or uta.",
+    )
+    parser.add_argument(
+        "--url",
+        help="Override GTFS download URL for the selected agency.",
     )
     parser.add_argument(
         "--output",
         "-o",
-        default="gtfs.sqlite",
+        default=None,
         help="Output SQLite database filename.",
     )
     parser.add_argument(
@@ -293,25 +356,50 @@ def main() -> int:
     args = parse_args()
     configure_logging(args.log_level)
 
-    LOGGER.info("Starting GTFS conversion pipeline")
-    LOGGER.info("Input path: %s", args.input_path)
-    LOGGER.info("Output database: %s", args.output)
-
-    if not args.input_path.exists():
-        LOGGER.error("Input path does not exist: %s", args.input_path)
+    try:
+        agencies_config = load_agencies_config(get_agencies_config_path())
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        LOGGER.error("Failed to load agencies config: %s", error)
         return 1
 
-    if not args.input_path.is_dir():
-        LOGGER.error("Input path is not a directory: %s", args.input_path)
+    agency_config: dict[str, str] | None = None
+    if args.agency:
+        try:
+            agency_config = resolve_agency_config(agencies_config, args.agency)
+        except ValueError as error:
+            LOGGER.error("%s", error)
+            return 1
+
+    try:
+        input_path = resolve_input_path(args.input_path, args.agency)
+    except (ValueError, FileNotFoundError) as error:
+        LOGGER.error("%s", error)
+        return 1
+
+    gtfs_url = args.url or (agency_config or {}).get("url")
+    output_path = resolve_output_path(input_path, args.agency, args.output)
+
+    LOGGER.info("Starting GTFS conversion pipeline")
+    LOGGER.info("Agency: %s", args.agency or input_path.name)
+    LOGGER.info("Input path: %s", input_path)
+    LOGGER.info("Output database: %s", output_path)
+    if gtfs_url:
+        LOGGER.info("GTFS URL: %s", gtfs_url)
+
+    if not input_path.exists():
+        LOGGER.error("Input path does not exist: %s", input_path)
+        return 1
+
+    if not input_path.is_dir():
+        LOGGER.error("Input path is not a directory: %s", input_path)
         return 1
 
     try:
-        gtfs_files = discover_gtfs_files(args.input_path)
+        gtfs_files = discover_gtfs_files(input_path)
     except FileNotFoundError as error:
         LOGGER.error("%s", error)
         return 1
 
-    output_path = build_output_path(args.input_path, args.output)
     LOGGER.info("Discovered %d GTFS files", len(gtfs_files))
     LOGGER.debug("GTFS files: %s", [path.name for path in gtfs_files])
 
@@ -336,7 +424,7 @@ def main() -> int:
         return 1
 
     try:
-        create_app_metadata(connection, args.input_path)
+        create_app_metadata(connection, input_path)
     except sqlite3.Error as error:
         LOGGER.error("Failed to create app_metadata: %s", error)
         connection.close()
