@@ -1,10 +1,10 @@
 [
   {
     "id": "pvta", 
-    "url": "https://transitfeeds.com/p/pvta/6/latest/download"
+    "url": "https://www.pvta.com/g_trans/google_transit.zip"
   },
   {
     "id": "uta",
-    "url": "https://transitfeeds.com/p/utah-transit-authority/58/latest/download"
+    "url": "https://gtfsfeed.rideuta.com/GTFS.zip"
   }
 ]
