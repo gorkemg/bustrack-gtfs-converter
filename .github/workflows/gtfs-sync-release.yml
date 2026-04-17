@@ -92,19 +92,75 @@ jobs:
           path: data/${{ matrix.agency }}.sqlite.zip
           if-no-files-found: error
 
-      - name: Create or Update GitHub Release
+      - name: Capture Current Production Asset
+        id: previous_asset
+        if: steps.check_file.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p previous-release
+          if gh release view "${{ matrix.agency }}" --repo "${{ github.repository }}" --json assets > current_release.json 2>/dev/null; then
+            asset_name=$(python -c 'import json, pathlib; payload = json.loads(pathlib.Path("current_release.json").read_text(encoding="utf-8")); print(next((str(asset.get("name", "")) for asset in payload.get("assets", []) if str(asset.get("name", "")).endswith(".sqlite.zip")), ""))')
+            if [ -n "$asset_name" ]; then
+              gh release download "${{ matrix.agency }}" --repo "${{ github.repository }}" --pattern "$asset_name" --dir previous-release --clobber
+              mv "previous-release/$asset_name" "previous-release/${{ matrix.agency }}-previous.sqlite.zip"
+              echo "available=true" >> "$GITHUB_OUTPUT"
+              echo "asset_path=previous-release/${{ matrix.agency }}-previous.sqlite.zip" >> "$GITHUB_OUTPUT"
+            else
+              echo "available=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Archive Release
         if: steps.check_file.outputs.created == 'true'
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ matrix.agency }}
-          name: ${{ matrix.agency }} GTFS ${{ steps.timestamp.outputs.value }}
+          tag_name: ${{ matrix.agency }}-${{ steps.timestamp.outputs.value }}
+          name: ${{ matrix.agency }} Archive ${{ steps.timestamp.outputs.value }}
           files: data/${{ matrix.agency }}.sqlite.zip
           body: |
-            Automated GTFS update for ${{ matrix.agency }}.
+            Immutable GTFS archive release for ${{ matrix.agency }}.
             Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             Commit: ${{ github.sha }}
           draft: false
           prerelease: false
+          make_latest: false
+          append_body: false
+          generate_release_notes: false
+
+      - name: Create or Update Previous Release
+        if: steps.previous_asset.outputs.available == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ matrix.agency }}-previous
+          name: ${{ matrix.agency }} Previous ${{ steps.timestamp.outputs.value }}
+          files: ${{ steps.previous_asset.outputs.asset_path }}
+          body: |
+            Rollback release captured from the prior production asset for ${{ matrix.agency }}.
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Commit: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          make_latest: false
+          append_body: false
+          generate_release_notes: false
+
+      - name: Create or Update Production Release
+        if: steps.check_file.outputs.created == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ matrix.agency }}
+          name: ${{ matrix.agency }} Production ${{ steps.timestamp.outputs.value }}
+          files: data/${{ matrix.agency }}.sqlite.zip
+          body: |
+            Production GTFS release for ${{ matrix.agency }}.
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Commit: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          make_latest: true
           append_body: false
           generate_release_notes: false
 
