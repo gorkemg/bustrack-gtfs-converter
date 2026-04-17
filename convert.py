@@ -4,10 +4,12 @@ import argparse
 import csv
 import logging
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 
 LOGGER = logging.getLogger("gtfs_converter")
+IMPORT_CHUNK_SIZE = 5000
 
 INTEGER_COLUMN_NAMES = {
     "bikes_allowed",
@@ -117,6 +119,58 @@ def build_create_table_sql(table_name: str, columns: list[str]) -> str:
     )
 
 
+def build_insert_sql(table_name: str, columns: list[str]) -> str:
+    quoted_columns = ", ".join(quote_identifier(column_name) for column_name in columns)
+    placeholders = ", ".join("?" for _ in columns)
+    return (
+        f"INSERT INTO {quote_identifier(table_name)} ({quoted_columns}) "
+        f"VALUES ({placeholders})"
+    )
+
+
+def convert_value(raw_value: str, column_name: str) -> int | float | str | None:
+    value = raw_value.strip()
+    if value == "":
+        return None
+
+    sqlite_type = infer_sqlite_type(column_name)
+    if sqlite_type == "INTEGER":
+        return int(value)
+
+    if sqlite_type == "REAL":
+        return float(value)
+
+    return value
+
+
+def iter_gtfs_chunks(
+    file_path: Path, columns: list[str], chunk_size: int = IMPORT_CHUNK_SIZE
+) -> Iterator[list[tuple[int | float | str | None, ...]]]:
+    with file_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle)
+        next(reader, None)
+        chunk: list[tuple[int | float | str | None, ...]] = []
+
+        for row_number, row in enumerate(reader, start=2):
+            if len(row) != len(columns):
+                raise ValueError(
+                    f"Row {row_number} in {file_path} has {len(row)} values; expected {len(columns)}"
+                )
+
+            converted_row = tuple(
+                convert_value(raw_value, column_name)
+                for column_name, raw_value in zip(columns, row)
+            )
+            chunk.append(converted_row)
+
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
+
+        if chunk:
+            yield chunk
+
+
 def create_gtfs_tables(connection: sqlite3.Connection, gtfs_files: list[Path]) -> None:
     with connection:
         for gtfs_file in gtfs_files:
@@ -127,6 +181,21 @@ def create_gtfs_tables(connection: sqlite3.Connection, gtfs_files: list[Path]) -
             LOGGER.info(
                 "Created table %s with %d columns", table_name, len(columns)
             )
+
+
+def import_gtfs_data(connection: sqlite3.Connection, gtfs_files: list[Path]) -> None:
+    for gtfs_file in gtfs_files:
+        table_name = gtfs_file.stem
+        columns = read_gtfs_header(gtfs_file)
+        insert_sql = build_insert_sql(table_name, columns)
+        imported_rows = 0
+
+        with connection:
+            for chunk in iter_gtfs_chunks(gtfs_file, columns):
+                connection.executemany(insert_sql, chunk)
+                imported_rows += len(chunk)
+
+        LOGGER.info("Imported %d rows into %s", imported_rows, table_name)
 
 
 def parse_args() -> argparse.Namespace:
@@ -199,8 +268,15 @@ def main() -> int:
         connection.close()
         return 1
 
+    try:
+        import_gtfs_data(connection, gtfs_files)
+    except (OSError, ValueError, sqlite3.Error) as error:
+        LOGGER.error("Failed to import GTFS data: %s", error)
+        connection.close()
+        return 1
+
     connection.close()
-    LOGGER.info("SQLite schema initialized successfully: %s", output_path)
+    LOGGER.info("SQLite schema and data initialized successfully: %s", output_path)
     return 0
 
 
