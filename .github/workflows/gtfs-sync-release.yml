@@ -5,6 +5,9 @@ on:
     - cron: '0 8 * * *'
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 concurrency:
   group: gtfs-sync-release-${{ github.ref }}
   cancel-in-progress: false
@@ -46,6 +49,10 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Prepare Timestamp
+        run: |
+          echo "TIMESTAMP=$(date -u +'%Y%m%d-%H%M')" >> "$GITHUB_ENV"
+
       - name: Run Converter
         id: converter
         continue-on-error: true
@@ -58,7 +65,7 @@ jobs:
 
       - name: Upload Converter Log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: converter-log-${{ matrix.agency }}
           path: logs/${{ matrix.agency }}.log
@@ -81,7 +88,7 @@ jobs:
 
       - name: Upload SQLite Archive Artifact
         if: steps.check_file.outputs.created == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sqlite-archive-${{ matrix.agency }}
           path: data/${{ matrix.agency }}.sqlite.zip
@@ -89,7 +96,7 @@ jobs:
 
       - name: Create or Update GitHub Release
         if: steps.check_file.outputs.created == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ matrix.agency }}
           name: ${{ matrix.agency }} GTFS ${{ steps.release_meta.outputs.timestamp }}
