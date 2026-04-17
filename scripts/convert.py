@@ -7,7 +7,10 @@ import logging
 import sqlite3
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 LOGGER = logging.getLogger("gtfs_converter")
@@ -68,6 +71,10 @@ def get_agencies_config_path() -> Path:
     return get_repo_root() / "config" / "agencies.json"
 
 
+def get_release_cache_path() -> Path:
+    return get_repo_root() / "data" / "release_cache.json"
+
+
 def load_agencies_config(config_path: Path) -> list[dict[str, str]]:
     with config_path.open("r", encoding="utf-8") as handle:
         config = json.load(handle)
@@ -76,6 +83,81 @@ def load_agencies_config(config_path: Path) -> list[dict[str, str]]:
         raise ValueError(f"Agency config must be a JSON list: {config_path}")
 
     return config
+
+
+def load_release_cache(cache_path: Path) -> dict[str, dict[str, str]]:
+    if not cache_path.exists():
+        return {}
+
+    with cache_path.open("r", encoding="utf-8") as handle:
+        cache = json.load(handle)
+
+    if not isinstance(cache, dict):
+        raise ValueError(f"Release cache must be a JSON object: {cache_path}")
+
+    return cache
+
+
+def save_release_cache(cache_path: Path, cache: dict[str, dict[str, str]]) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("w", encoding="utf-8") as handle:
+        json.dump(cache, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def parse_http_datetime(value: str) -> datetime:
+    parsed_value = parsedate_to_datetime(value)
+    if parsed_value.tzinfo is None:
+        return parsed_value.replace(tzinfo=timezone.utc)
+    return parsed_value.astimezone(timezone.utc)
+
+
+def parse_iso8601_datetime(value: str) -> datetime:
+    parsed_value = datetime.fromisoformat(value)
+    if parsed_value.tzinfo is None:
+        return parsed_value.replace(tzinfo=timezone.utc)
+    return parsed_value.astimezone(timezone.utc)
+
+
+def fetch_last_modified(gtfs_url: str) -> datetime:
+    request = Request(gtfs_url, method="HEAD")
+    with urlopen(request, timeout=30) as response:
+        last_modified = response.headers.get("Last-Modified")
+
+    if not last_modified:
+        raise ValueError(f"No Last-Modified header returned for {gtfs_url}")
+
+    return parse_http_datetime(last_modified)
+
+
+def needs_update(
+    agency_id: str, gtfs_url: str, cache_path: Path | None = None
+) -> tuple[bool, datetime]:
+    effective_cache_path = cache_path or get_release_cache_path()
+    upstream_last_modified = fetch_last_modified(gtfs_url)
+    release_cache = load_release_cache(effective_cache_path)
+    cached_release = release_cache.get(agency_id, {})
+    cached_release_date = cached_release.get("released_at")
+
+    if not cached_release_date:
+        return True, upstream_last_modified
+
+    last_release_date = parse_iso8601_datetime(cached_release_date)
+    return upstream_last_modified > last_release_date, upstream_last_modified
+
+
+def update_release_cache(
+    agency_id: str,
+    upstream_last_modified: datetime,
+    cache_path: Path | None = None,
+) -> None:
+    effective_cache_path = cache_path or get_release_cache_path()
+    release_cache = load_release_cache(effective_cache_path)
+    release_cache[agency_id] = {
+        "released_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source_last_modified": upstream_last_modified.isoformat(timespec="seconds"),
+    }
+    save_release_cache(effective_cache_path, release_cache)
 
 
 def resolve_agency_config(
@@ -386,6 +468,23 @@ def main() -> int:
     if gtfs_url:
         LOGGER.info("GTFS URL: %s", gtfs_url)
 
+    upstream_last_modified: datetime | None = None
+    if args.agency and gtfs_url:
+        try:
+            should_update, upstream_last_modified = needs_update(args.agency, gtfs_url)
+        except (
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+            HTTPError,
+            URLError,
+        ) as error:
+            LOGGER.warning("Release check failed, continuing with conversion: %s", error)
+        else:
+            if not should_update:
+                LOGGER.info("No update needed")
+                return 0
+
     if not input_path.exists():
         LOGGER.error("Input path does not exist: %s", input_path)
         return 1
@@ -438,6 +537,14 @@ def main() -> int:
         return 1
 
     connection.close()
+
+    if args.agency and upstream_last_modified is not None:
+        try:
+            update_release_cache(args.agency, upstream_last_modified)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            LOGGER.error("Failed to update release cache: %s", error)
+            return 1
+
     LOGGER.info(
         "SQLite schema, data, metadata, and indexes initialized successfully: %s",
         output_path,
