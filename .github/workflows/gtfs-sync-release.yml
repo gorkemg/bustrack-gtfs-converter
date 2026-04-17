@@ -16,6 +16,8 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout Repository
@@ -50,8 +52,10 @@ jobs:
           python-version: '3.11'
 
       - name: Prepare Timestamp
+        id: timestamp
         run: |
           echo "TIMESTAMP=$(date -u +'%Y%m%d-%H%M')" >> "$GITHUB_ENV"
+          echo "value=$(date -u +'%Y%m%d-%H%M')" >> "$GITHUB_OUTPUT"
 
       - name: Run Converter
         id: converter
@@ -80,12 +84,6 @@ jobs:
             echo "created=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Prepare Release Metadata
-        id: release_meta
-        if: steps.check_file.outputs.created == 'true'
-        run: |
-          echo "timestamp=$(date -u +'%Y-%m-%d %H:%M UTC')" >> "$GITHUB_OUTPUT"
-
       - name: Upload SQLite Archive Artifact
         if: steps.check_file.outputs.created == 'true'
         uses: actions/upload-artifact@v7
@@ -99,7 +97,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ matrix.agency }}
-          name: ${{ matrix.agency }} GTFS ${{ steps.release_meta.outputs.timestamp }}
+          name: ${{ matrix.agency }} GTFS ${{ steps.timestamp.outputs.value }}
           files: data/${{ matrix.agency }}.sqlite.zip
           body: |
             Automated GTFS update for ${{ matrix.agency }}.
