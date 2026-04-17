@@ -5,10 +5,6 @@ on:
     - cron: '0 8 * * *'
   workflow_dispatch:
 
-env:
-  # Fix for the Node.js 20 Deprecation Warnings
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 concurrency:
   group: gtfs-sync-release-${{ github.ref }}
   cancel-in-progress: false
@@ -20,10 +16,10 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -43,10 +39,10 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -77,6 +73,12 @@ jobs:
             echo "created=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Prepare Release Metadata
+        id: release_meta
+        if: steps.check_file.outputs.created == 'true'
+        run: |
+          echo "timestamp=$(date -u +'%Y-%m-%d %H:%M UTC')" >> "$GITHUB_OUTPUT"
+
       - name: Upload SQLite Archive Artifact
         if: steps.check_file.outputs.created == 'true'
         uses: actions/upload-artifact@v4
@@ -90,7 +92,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ matrix.agency }}
-          name: Latest ${{ matrix.agency }} Data
+          name: ${{ matrix.agency }} GTFS ${{ steps.release_meta.outputs.timestamp }}
           files: data/${{ matrix.agency }}.sqlite.zip
           body: |
             Automated GTFS update for ${{ matrix.agency }}.
@@ -98,7 +100,6 @@ jobs:
             Commit: ${{ github.sha }}
           draft: false
           prerelease: false
-          make_latest: true
           append_body: false
           generate_release_notes: false
 
