@@ -146,6 +146,19 @@ def parse_github_datetime(value: str) -> datetime:
     return parse_iso8601_datetime(normalized_value)
 
 
+def parse_recorded_datetime(value: str) -> datetime:
+    try:
+        return parse_iso8601_datetime(value)
+    except ValueError:
+        return parse_http_datetime(value)
+
+
+def normalize_release_metadata_value(value: str | None) -> str:
+    if value is None:
+        return ""
+    return value.strip()
+
+
 def build_http_request(url: str, method: str = "GET", github_api: bool = False) -> Request:
     headers = {
         "User-Agent": USER_AGENT,
@@ -171,14 +184,50 @@ def fetch_last_modified(gtfs_url: str) -> datetime:
     return parse_http_datetime(last_modified)
 
 
-def fetch_latest_release_timestamp_from_github(agency_id: str) -> datetime | None:
+def fetch_source_metadata(gtfs_url: str) -> dict[str, str]:
+    request = build_http_request(gtfs_url, method="HEAD")
+    with urlopen(request, timeout=30) as response:
+        last_modified = response.headers.get("Last-Modified")
+        etag = response.headers.get("ETag")
+
+    metadata = {
+        "source_last_modified": normalize_release_metadata_value(last_modified),
+        "source_etag": normalize_release_metadata_value(etag),
+    }
+    if not metadata["source_last_modified"] and not metadata["source_etag"]:
+        raise ValueError(f"No source metadata headers returned for {gtfs_url}")
+
+    return metadata
+
+
+def parse_release_metadata_from_body(body: str) -> dict[str, str]:
+    metadata = {
+        "source_last_modified": "",
+        "source_etag": "",
+    }
+
+    for line in body.splitlines():
+        stripped_line = line.strip()
+        if stripped_line.startswith("<!-- source_last_modified:") and stripped_line.endswith("-->"):
+            metadata["source_last_modified"] = normalize_release_metadata_value(
+                stripped_line.removeprefix("<!-- source_last_modified:").removesuffix("-->")
+            )
+        if stripped_line.startswith("<!-- source_etag:") and stripped_line.endswith("-->"):
+            metadata["source_etag"] = normalize_release_metadata_value(
+                stripped_line.removeprefix("<!-- source_etag:").removesuffix("-->")
+            )
+
+    return metadata
+
+
+def fetch_release_source_metadata_from_github(agency_id: str) -> dict[str, str] | None:
     repository = os.environ.get("GITHUB_REPOSITORY")
     if not repository:
         return None
 
     github_api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
-    releases_url = f"{github_api_url}/repos/{repository}/releases?per_page=100"
-    request = build_http_request(releases_url, github_api=True)
+    release_url = f"{github_api_url}/repos/{repository}/releases/tags/{agency_id}"
+    request = build_http_request(release_url, github_api=True)
 
     try:
         with urlopen(request, timeout=30) as response:
@@ -188,74 +237,80 @@ def fetch_latest_release_timestamp_from_github(agency_id: str) -> datetime | Non
             return None
         raise
 
-    if not isinstance(payload, list):
-        raise ValueError("GitHub releases response must be a JSON list")
+    if not isinstance(payload, dict):
+        raise ValueError("GitHub release response must be a JSON object")
 
-    matching_timestamps: list[datetime] = []
-    for release in payload:
-        if not isinstance(release, dict):
-            continue
+    body = str(payload.get("body", ""))
+    metadata = parse_release_metadata_from_body(body)
+    published_at = payload.get("published_at") or payload.get("created_at")
+    if published_at:
+        metadata["released_at"] = parse_github_datetime(str(published_at)).isoformat(timespec="seconds")
 
-        tag_name = str(release.get("tag_name", ""))
-        release_name = str(release.get("name", ""))
-        if not (
-            tag_name == agency_id
-            or tag_name.startswith(f"{agency_id}-")
-            or release_name == agency_id
-            or release_name.startswith(f"{agency_id}-")
-        ):
-            continue
-
-        published_at = release.get("published_at") or release.get("created_at")
-        if not published_at:
-            continue
-
-        matching_timestamps.append(parse_github_datetime(str(published_at)))
-
-    if not matching_timestamps:
-        return None
-
-    return max(matching_timestamps)
+    return metadata
 
 
-def get_last_successful_release_timestamp(
+def get_last_successful_release_metadata(
     agency_id: str, cache_path: Path | None = None
-) -> datetime | None:
-    github_release_timestamp = fetch_latest_release_timestamp_from_github(agency_id)
-    if github_release_timestamp is not None:
-        return github_release_timestamp
+) -> dict[str, str]:
+    github_release_metadata = fetch_release_source_metadata_from_github(agency_id)
+    if github_release_metadata is not None:
+        return github_release_metadata
 
     effective_cache_path = cache_path or get_release_cache_path()
     release_cache = load_release_cache(effective_cache_path)
-    cached_release = release_cache.get(agency_id, {})
-    cached_release_date = cached_release.get("released_at")
-    if not cached_release_date:
-        return None
+    return {
+        "released_at": normalize_release_metadata_value(release_cache.get(agency_id, {}).get("released_at")),
+        "source_last_modified": normalize_release_metadata_value(release_cache.get(agency_id, {}).get("source_last_modified")),
+        "source_etag": normalize_release_metadata_value(release_cache.get(agency_id, {}).get("source_etag")),
+    }
 
-    return parse_iso8601_datetime(cached_release_date)
+
+def compare_source_metadata(
+    upstream_metadata: dict[str, str], last_release_metadata: dict[str, str]
+) -> tuple[bool, str]:
+    upstream_etag = upstream_metadata.get("source_etag", "")
+    release_etag = last_release_metadata.get("source_etag", "")
+    if upstream_etag and release_etag:
+        if upstream_etag != release_etag:
+            return True, "source_etag_changed"
+        return False, "source_etag_unchanged"
+
+    upstream_last_modified = upstream_metadata.get("source_last_modified", "")
+    release_last_modified = last_release_metadata.get("source_last_modified", "")
+    if upstream_last_modified and release_last_modified:
+        upstream_dt = parse_http_datetime(upstream_last_modified)
+        release_dt = parse_recorded_datetime(release_last_modified)
+        if upstream_dt > release_dt:
+            return True, "source_last_modified_newer"
+        return False, "source_last_modified_not_newer"
+
+    return True, "missing_comparable_release_metadata"
 
 
 def needs_update(
     agency_id: str, gtfs_url: str, cache_path: Path | None = None
-) -> tuple[bool, datetime]:
-    upstream_last_modified = fetch_last_modified(gtfs_url)
-    last_release_date = get_last_successful_release_timestamp(agency_id, cache_path)
-    if last_release_date is None:
-        return True, upstream_last_modified
+) -> tuple[bool, dict[str, str], dict[str, str], str]:
+    upstream_metadata = fetch_source_metadata(gtfs_url)
+    last_release_metadata = get_last_successful_release_metadata(agency_id, cache_path)
 
-    return upstream_last_modified > last_release_date, upstream_last_modified
+    if not last_release_metadata.get("source_last_modified") and not last_release_metadata.get("source_etag"):
+        return True, upstream_metadata, last_release_metadata, "no_previous_source_metadata"
+
+    should_update, decision_reason = compare_source_metadata(upstream_metadata, last_release_metadata)
+    return should_update, upstream_metadata, last_release_metadata, decision_reason
 
 
 def update_release_cache(
     agency_id: str,
-    upstream_last_modified: datetime,
+    upstream_metadata: dict[str, str],
     cache_path: Path | None = None,
 ) -> None:
     effective_cache_path = cache_path or get_release_cache_path()
     release_cache = load_release_cache(effective_cache_path)
     release_cache[agency_id] = {
         "released_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "source_last_modified": upstream_last_modified.isoformat(timespec="seconds"),
+        "source_last_modified": normalize_release_metadata_value(upstream_metadata.get("source_last_modified")),
+        "source_etag": normalize_release_metadata_value(upstream_metadata.get("source_etag")),
     }
     save_release_cache(effective_cache_path, release_cache)
 
@@ -627,6 +682,42 @@ def create_app_metadata(
     LOGGER.info("Created app_metadata with %d entries", len(metadata_rows))
 
 
+def write_release_notes(
+    release_notes_path: Path,
+    agency_id: str,
+    source_metadata: dict[str, str],
+    validated_tables: int,
+    total_rows: int,
+) -> None:
+    workflow_run_id = os.environ.get("GITHUB_RUN_ID", "")
+    github_repository = os.environ.get("GITHUB_REPOSITORY", "")
+    github_server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    github_sha = os.environ.get("GITHUB_SHA", "")
+    workflow_url = ""
+    if workflow_run_id and github_repository:
+        workflow_url = f"{github_server_url}/{github_repository}/actions/runs/{workflow_run_id}"
+
+    notes_lines = [
+        f"Automated GTFS release for {agency_id}.",
+        f"Validated tables: {validated_tables}",
+        f"Validated rows: {total_rows}",
+    ]
+    if workflow_url:
+        notes_lines.append(f"Workflow run: {workflow_url}")
+    if github_sha:
+        notes_lines.append(f"Commit: {github_sha}")
+    notes_lines.extend(
+        [
+            "",
+            f"<!-- source_last_modified: {normalize_release_metadata_value(source_metadata.get('source_last_modified'))} -->",
+            f"<!-- source_etag: {normalize_release_metadata_value(source_metadata.get('source_etag'))} -->",
+        ]
+    )
+
+    release_notes_path.write_text("\n".join(notes_lines) + "\n", encoding="utf-8")
+    LOGGER.info("Wrote release notes to %s", release_notes_path)
+
+
 def build_index_name(table_name: str, columns: tuple[str, ...]) -> str:
     return f"idx_{table_name}_{'_'.join(columns)}"
 
@@ -742,12 +833,14 @@ def main() -> int:
     if gtfs_url:
         LOGGER.info("GTFS URL: %s", gtfs_url)
 
-    upstream_last_modified: datetime | None = None
+    upstream_metadata: dict[str, str] | None = None
     should_download = False
     release_check_failed = False
     if args.agency and gtfs_url:
         try:
-            should_update, upstream_last_modified = needs_update(args.agency, gtfs_url)
+            should_update, upstream_metadata, last_release_metadata, decision_reason = needs_update(
+                args.agency, gtfs_url
+            )
         except (
             OSError,
             ValueError,
@@ -758,20 +851,24 @@ def main() -> int:
             release_check_failed = True
             LOGGER.warning("Release check failed, evaluating local GTFS availability: %s", error)
         else:
+            LOGGER.info(
+                "Release decision for %s: should_update=%s, reason=%s, upstream_last_modified=%s, upstream_etag=%s, release_source_last_modified=%s, release_source_etag=%s",
+                args.agency,
+                should_update,
+                decision_reason,
+                upstream_metadata.get("source_last_modified", ""),
+                upstream_metadata.get("source_etag", ""),
+                last_release_metadata.get("source_last_modified", ""),
+                last_release_metadata.get("source_etag", ""),
+            )
             if not should_update:
-                if is_folder_empty(input_path):
-                    LOGGER.info("No remote update detected, but local GTFS folder is empty. Forcing download.")
-                    should_download = True
-                else:
-                    LOGGER.info("No update needed")
-                    return 0
+                LOGGER.info("No update needed; skipping download, conversion, and release creation.")
+                return 0
             should_download = True
 
-    if gtfs_url and (not input_path.exists() or is_folder_empty(input_path)):
+    if gtfs_url and release_check_failed and (not input_path.exists() or is_folder_empty(input_path)):
         if release_check_failed:
             LOGGER.info("Local GTFS folder is missing or empty after release-check failure. Forcing download.")
-        elif not should_download:
-            LOGGER.info("Local GTFS folder is missing or empty. Forcing download.")
         should_download = True
 
     if should_download:
@@ -834,9 +931,9 @@ def main() -> int:
 
     connection.close()
 
-    if args.agency and upstream_last_modified is not None:
+    if args.agency and upstream_metadata is not None:
         try:
-            update_release_cache(args.agency, upstream_last_modified)
+            update_release_cache(args.agency, upstream_metadata)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             LOGGER.error("Failed to update release cache: %s", error)
             return 1
@@ -854,6 +951,20 @@ def main() -> int:
     except (OSError, ValueError, zipfile.BadZipFile) as error:
         LOGGER.error("Failed to create SQLite archive: %s", error)
         return 1
+
+    if args.agency and upstream_metadata is not None:
+        release_notes_path = output_path.with_suffix(".release-notes.md")
+        try:
+            write_release_notes(
+                release_notes_path,
+                args.agency,
+                upstream_metadata,
+                validated_tables,
+                total_rows,
+            )
+        except OSError as error:
+            LOGGER.error("Failed to write release notes: %s", error)
+            return 1
 
     if should_download and args.cleanup_extracted:
         try:

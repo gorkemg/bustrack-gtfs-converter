@@ -15,6 +15,51 @@ from scripts import convert
 
 
 class ConvertTests(unittest.TestCase):
+    def test_parse_release_metadata_from_body_reads_hidden_markers(self) -> None:
+        body = "\n".join(
+            [
+                "Automated GTFS release for pvta.",
+                "<!-- source_last_modified: Thu, 17 Apr 2026 10:00:00 GMT -->",
+                "<!-- source_etag: etag-123 -->",
+            ]
+        )
+
+        metadata = convert.parse_release_metadata_from_body(body)
+
+        self.assertEqual(metadata["source_last_modified"], "Thu, 17 Apr 2026 10:00:00 GMT")
+        self.assertEqual(metadata["source_etag"], "etag-123")
+
+    def test_write_release_notes_persists_source_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            release_notes_path = Path(temp_dir) / "pvta.release-notes.md"
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "GITHUB_REPOSITORY": "example/repo",
+                    "GITHUB_RUN_ID": "123",
+                    "GITHUB_SHA": "abc123",
+                    "GITHUB_SERVER_URL": "https://github.com",
+                },
+                clear=False,
+            ):
+                convert.write_release_notes(
+                    release_notes_path,
+                    "pvta",
+                    {
+                        "source_last_modified": "Thu, 17 Apr 2026 10:00:00 GMT",
+                        "source_etag": "etag-123",
+                    },
+                    16,
+                    653005,
+                )
+
+            content = release_notes_path.read_text(encoding="utf-8")
+            self.assertIn("Validated tables: 16", content)
+            self.assertIn("Validated rows: 653005", content)
+            self.assertIn("<!-- source_last_modified: Thu, 17 Apr 2026 10:00:00 GMT -->", content)
+            self.assertIn("<!-- source_etag: etag-123 -->", content)
+
     def test_extract_feed_date_range_prefers_feed_info(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             input_dir = Path(temp_dir)
@@ -81,9 +126,9 @@ class ConvertTests(unittest.TestCase):
 
         self.assertEqual(request.get_header("User-agent"), convert.USER_AGENT)
 
-    def test_fetch_latest_release_timestamp_returns_none_for_404(self) -> None:
+    def test_fetch_release_source_metadata_from_github_returns_none_for_404(self) -> None:
         not_found_error = HTTPError(
-            url="https://api.github.com/repos/example/repo/releases?per_page=100",
+            url="https://api.github.com/repos/example/repo/releases/tags/uta",
             code=404,
             msg="Not Found",
             hdrs=None,
@@ -92,9 +137,9 @@ class ConvertTests(unittest.TestCase):
 
         with patch.dict("os.environ", {"GITHUB_REPOSITORY": "example/repo"}, clear=False):
             with patch("scripts.convert.urlopen", side_effect=not_found_error):
-                release_timestamp = convert.fetch_latest_release_timestamp_from_github("uta")
+                release_metadata = convert.fetch_release_source_metadata_from_github("uta")
 
-        self.assertIsNone(release_timestamp)
+        self.assertIsNone(release_metadata)
 
     def test_download_and_extract_zip_populates_target_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -220,35 +265,68 @@ class ConvertTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 convert.validate_database(sqlite_path, csv_dir)
 
-    def test_needs_update_uses_github_release_timestamp(self) -> None:
-        upstream_time = datetime(2026, 4, 17, 10, 0, tzinfo=timezone.utc)
-        release_time = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+    def test_needs_update_returns_false_when_source_metadata_is_unchanged(self) -> None:
+        upstream_metadata = {
+            "source_last_modified": "Thu, 17 Apr 2026 10:00:00 GMT",
+            "source_etag": "etag-123",
+        }
+        release_metadata = {
+            "source_last_modified": "2026-04-17T10:00:00+00:00",
+            "source_etag": "etag-123",
+            "released_at": "2026-04-17T11:00:00+00:00",
+        }
 
-        with patch("scripts.convert.fetch_last_modified", return_value=upstream_time):
+        with patch("scripts.convert.fetch_source_metadata", return_value=upstream_metadata):
             with patch(
-                "scripts.convert.fetch_latest_release_timestamp_from_github",
-                return_value=release_time,
+                "scripts.convert.get_last_successful_release_metadata",
+                return_value=release_metadata,
             ):
-                should_update, actual_upstream_time = convert.needs_update(
+                should_update, actual_upstream_metadata, actual_release_metadata, decision_reason = convert.needs_update(
+                    "pvta", "https://example.test/pvta.zip"
+                )
+
+        self.assertFalse(should_update)
+        self.assertEqual(actual_upstream_metadata, upstream_metadata)
+        self.assertEqual(actual_release_metadata, release_metadata)
+        self.assertEqual(decision_reason, "source_etag_unchanged")
+
+    def test_needs_update_returns_true_when_source_last_modified_is_newer(self) -> None:
+        upstream_metadata = {
+            "source_last_modified": "Fri, 18 Apr 2026 10:00:00 GMT",
+            "source_etag": "",
+        }
+        release_metadata = {
+            "source_last_modified": "2026-04-17T10:00:00+00:00",
+            "source_etag": "",
+            "released_at": "2026-04-17T11:00:00+00:00",
+        }
+
+        with patch("scripts.convert.fetch_source_metadata", return_value=upstream_metadata):
+            with patch(
+                "scripts.convert.get_last_successful_release_metadata",
+                return_value=release_metadata,
+            ):
+                should_update, _, _, decision_reason = convert.needs_update(
                     "pvta", "https://example.test/pvta.zip"
                 )
 
         self.assertTrue(should_update)
-        self.assertEqual(actual_upstream_time, upstream_time)
+        self.assertEqual(decision_reason, "source_last_modified_newer")
 
     def test_update_release_cache_writes_expected_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = Path(temp_dir) / "release_cache.json"
-            upstream_time = datetime(2026, 4, 17, 10, 0, tzinfo=timezone.utc)
+            upstream_metadata = {
+                "source_last_modified": "Thu, 17 Apr 2026 10:00:00 GMT",
+                "source_etag": "etag-123",
+            }
 
-            convert.update_release_cache("pvta", upstream_time, cache_path=cache_path)
+            convert.update_release_cache("pvta", upstream_metadata, cache_path=cache_path)
 
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
             self.assertIn("pvta", payload)
-            self.assertEqual(
-                payload["pvta"]["source_last_modified"],
-                upstream_time.isoformat(timespec="seconds"),
-            )
+            self.assertEqual(payload["pvta"]["source_last_modified"], "Thu, 17 Apr 2026 10:00:00 GMT")
+            self.assertEqual(payload["pvta"]["source_etag"], "etag-123")
 
     def test_main_runs_end_to_end_for_local_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

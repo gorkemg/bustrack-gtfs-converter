@@ -119,6 +119,15 @@ jobs:
           path: data/${{ matrix.agency }}.sqlite.zip
           if-no-files-found: error
 
+      - name: Check if Release Notes were created
+        id: check_release_notes
+        run: |
+          if [ -f "data/${{ matrix.agency }}.release-notes.md" ]; then
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Capture Current Production Asset
         id: previous_asset
         if: steps.check_file.outputs.created == 'true'
@@ -147,10 +156,7 @@ jobs:
           tag_name: ${{ matrix.agency }}-${{ steps.timestamp.outputs.value }}
           name: ${{ matrix.agency }} Archive ${{ steps.timestamp.outputs.value }}
           files: data/${{ matrix.agency }}.sqlite.zip
-          body: |
-            Immutable GTFS archive release for ${{ matrix.agency }}.
-            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            Commit: ${{ github.sha }}
+          body_path: data/${{ matrix.agency }}.release-notes.md
           draft: false
           prerelease: false
           make_latest: false
@@ -181,10 +187,7 @@ jobs:
           tag_name: ${{ matrix.agency }}
           name: ${{ matrix.agency }} Production ${{ steps.timestamp.outputs.value }}
           files: data/${{ matrix.agency }}.sqlite.zip
-          body: |
-            Production GTFS release for ${{ matrix.agency }}.
-            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            Commit: ${{ github.sha }}
+          body_path: data/${{ matrix.agency }}.release-notes.md
           draft: false
           prerelease: false
           make_latest: false
