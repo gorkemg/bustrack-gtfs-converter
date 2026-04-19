@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import uuid
 import zipfile
 from io import BytesIO
 from datetime import datetime, timezone
@@ -120,6 +121,68 @@ class ConvertTests(unittest.TestCase):
             self.assertEqual(rows["workflow_run_id"], "987654")
             self.assertEqual(rows["feed_start_date"], "20250101")
             self.assertEqual(rows["feed_end_date"], "20251231")
+            self.assertTrue(rows["build_id"])
+            self.assertEqual(str(uuid.UUID(rows["build_id"])), rows["build_id"])
+
+    def test_create_recommended_indexes_adds_requested_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            gtfs_dir = Path(temp_dir)
+            (gtfs_dir / "trips.txt").write_text(
+                "route_id,service_id,trip_id,trip_headsign,shape_id\nR1,S1,T1,Headsign,SH1\n",
+                encoding="utf-8",
+            )
+            (gtfs_dir / "routes.txt").write_text(
+                "route_id,route_short_name\nR1,1\n",
+                encoding="utf-8",
+            )
+            (gtfs_dir / "stops.txt").write_text(
+                "stop_id,stop_name,stop_lat,stop_lon\n1,Stop A,1.0,2.0\n",
+                encoding="utf-8",
+            )
+            (gtfs_dir / "stop_times.txt").write_text(
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence\nT1,08:00:00,08:01:00,1,1\n",
+                encoding="utf-8",
+            )
+            (gtfs_dir / "calendar_dates.txt").write_text(
+                "service_id,date,exception_type\nS1,20250101,1\n",
+                encoding="utf-8",
+            )
+            (gtfs_dir / "calendar.txt").write_text(
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+                "WK,1,1,1,1,1,0,0,20250101,20251231\n",
+                encoding="utf-8",
+            )
+
+            gtfs_files = [
+                gtfs_dir / "calendar.txt",
+                gtfs_dir / "calendar_dates.txt",
+                gtfs_dir / "routes.txt",
+                gtfs_dir / "stop_times.txt",
+                gtfs_dir / "stops.txt",
+                gtfs_dir / "trips.txt",
+            ]
+
+            connection = sqlite3.connect(":memory:")
+            try:
+                convert.create_gtfs_tables(connection, gtfs_files)
+                convert.create_recommended_indexes(connection, gtfs_files)
+
+                index_names = {
+                    row[1]
+                    for row in connection.execute(
+                        "SELECT type, name FROM sqlite_master WHERE type = 'index'"
+                    ).fetchall()
+                }
+            finally:
+                connection.close()
+
+            self.assertIn("idx_trips_trip_id", index_names)
+            self.assertIn("idx_routes_route_id", index_names)
+            self.assertIn("idx_stops_stop_id", index_names)
+            self.assertIn("idx_stop_times_stop_id_departure_time", index_names)
+            self.assertIn("idx_stop_times_stop_id_arrival_time", index_names)
+            self.assertIn("idx_calendar_dates_date_service_id", index_names)
+            self.assertIn("idx_calendar_start_date_end_date", index_names)
 
     def test_build_http_request_uses_browser_user_agent(self) -> None:
         request = convert.build_http_request("https://example.test/feed.zip")

@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import uuid
 import zipfile
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -62,24 +63,32 @@ REAL_COLUMN_NAMES = {
 INDEX_SPECS = {
     "stop_times": [
         ("trip_id",),
+        ("stop_id", "departure_time"),
         ("stop_id", "arrival_time"),
         ("stop_sequence",),
     ],
     "trips": [
+        ("trip_id",),
         ("service_id", "route_id"),
         ("trip_headsign",),
         ("shape_id",),
     ],
     "calendar": [
+        ("start_date", "end_date"),
         ("service_id", "start_date", "end_date"),
     ],
     "calendar_dates": [
+        ("date", "service_id"),
         ("service_id", "date"),
+    ],
+    "routes": [
+        ("route_id",),
     ],
     "shapes": [
         ("shape_id",),
     ],
     "stops": [
+        ("stop_id",),
         ("stop_id", "stop_lat", "stop_lon"),
     ],
 }
@@ -661,6 +670,7 @@ def create_app_metadata(
             "build_timestamp",
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
         ),
+        ("build_id", str(uuid.uuid4())),
         ("agency_id", agency_id),
         ("git_commit_sha", os.environ.get("GITHUB_SHA", "")),
         ("workflow_run_id", os.environ.get("GITHUB_RUN_ID", "")),
