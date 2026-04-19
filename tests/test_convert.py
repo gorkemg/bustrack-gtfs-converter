@@ -470,6 +470,52 @@ class ConvertTests(unittest.TestCase):
             self.assertTrue(output_path.exists())
             self.assertTrue(output_path.with_suffix(".sqlite.zip").exists())
 
+    def test_main_force_update_bypasses_release_check_and_downloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            output_path = temp_root / "uta.sqlite"
+
+            def fake_download(url: str, target_dir: Path) -> None:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                (target_dir / "stops.txt").write_text(
+                    "stop_id,stop_name,stop_lat,stop_lon\n1,Stop A,1.0,2.0\n",
+                    encoding="utf-8",
+                )
+                (target_dir / "trips.txt").write_text(
+                    "route_id,service_id,trip_id,trip_headsign,shape_id\nR1,S1,T1,Headsign,SH1\n",
+                    encoding="utf-8",
+                )
+                (target_dir / "stop_times.txt").write_text(
+                    "trip_id,arrival_time,stop_id,stop_sequence\nT1,08:00:00,1,1\n",
+                    encoding="utf-8",
+                )
+
+            with patch(
+                "scripts.convert.load_agencies_config",
+                return_value=[{"id": "uta", "url": "https://example.test/uta.zip"}],
+            ):
+                with patch(
+                    "scripts.convert.needs_update",
+                    side_effect=AssertionError("needs_update must not be called when --force-update is set"),
+                ):
+                    with patch("scripts.convert.download_and_extract_zip", side_effect=fake_download):
+                        with patch(
+                            "sys.argv",
+                            [
+                                "convert.py",
+                                "--agency",
+                                "uta",
+                                "--force-update",
+                                "--output",
+                                str(output_path),
+                            ],
+                        ):
+                            exit_code = convert.main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(output_path.exists())
+            self.assertTrue(output_path.with_suffix(".sqlite.zip").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

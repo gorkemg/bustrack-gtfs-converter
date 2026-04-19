@@ -7,6 +7,11 @@ on:
   schedule:
     - cron: '0 8 * * *'
   workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Force update even if no new GTFS data is detected'
+        type: boolean
+        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -92,7 +97,11 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           mkdir -p logs
-          python scripts/convert.py --agency ${{ matrix.agency }} --cleanup-extracted 2>&1 | tee logs/${{ matrix.agency }}.log
+          FORCE_UPDATE_ARGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force_update }}" = "true" ]; then
+            FORCE_UPDATE_ARGS="--force-update"
+          fi
+          python scripts/convert.py --agency ${{ matrix.agency }} --cleanup-extracted $FORCE_UPDATE_ARGS 2>&1 | tee logs/${{ matrix.agency }}.log
 
       - name: Upload Converter Log
         if: always()

@@ -799,6 +799,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete the extracted GTFS folder after a successful run when data was downloaded.",
     )
+    parser.add_argument(
+        "--force-update",
+        action="store_true",
+        help="Force download and conversion even if no newer GTFS source metadata is detected.",
+    )
     return parser.parse_args()
 
 
@@ -847,34 +852,40 @@ def main() -> int:
     should_download = False
     release_check_failed = False
     if args.agency and gtfs_url:
-        try:
-            should_update, upstream_metadata, last_release_metadata, decision_reason = needs_update(
-                args.agency, gtfs_url
-            )
-        except (
-            OSError,
-            ValueError,
-            json.JSONDecodeError,
-            HTTPError,
-            URLError,
-        ) as error:
-            release_check_failed = True
-            LOGGER.warning("Release check failed, evaluating local GTFS availability: %s", error)
-        else:
-            LOGGER.info(
-                "Release decision for %s: should_update=%s, reason=%s, upstream_last_modified=%s, upstream_etag=%s, release_source_last_modified=%s, release_source_etag=%s",
-                args.agency,
-                should_update,
-                decision_reason,
-                upstream_metadata.get("source_last_modified", ""),
-                upstream_metadata.get("source_etag", ""),
-                last_release_metadata.get("source_last_modified", ""),
-                last_release_metadata.get("source_etag", ""),
-            )
-            if not should_update:
-                LOGGER.info("No update needed; skipping download, conversion, and release creation.")
-                return 0
+        if args.force_update:
             should_download = True
+            LOGGER.info(
+                "Force update enabled; skipping remote release comparison and downloading GTFS source."
+            )
+        else:
+            try:
+                should_update, upstream_metadata, last_release_metadata, decision_reason = needs_update(
+                    args.agency, gtfs_url
+                )
+            except (
+                OSError,
+                ValueError,
+                json.JSONDecodeError,
+                HTTPError,
+                URLError,
+            ) as error:
+                release_check_failed = True
+                LOGGER.warning("Release check failed, evaluating local GTFS availability: %s", error)
+            else:
+                LOGGER.info(
+                    "Release decision for %s: should_update=%s, reason=%s, upstream_last_modified=%s, upstream_etag=%s, release_source_last_modified=%s, release_source_etag=%s",
+                    args.agency,
+                    should_update,
+                    decision_reason,
+                    upstream_metadata.get("source_last_modified", ""),
+                    upstream_metadata.get("source_etag", ""),
+                    last_release_metadata.get("source_last_modified", ""),
+                    last_release_metadata.get("source_etag", ""),
+                )
+                if not should_update:
+                    LOGGER.info("No update needed; skipping download, conversion, and release creation.")
+                    return 0
+                should_download = True
 
     if gtfs_url and release_check_failed and (not input_path.exists() or is_folder_empty(input_path)):
         if release_check_failed:
