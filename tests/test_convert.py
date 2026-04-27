@@ -10,7 +10,7 @@ from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 from scripts import convert
 
@@ -183,6 +183,81 @@ class ConvertTests(unittest.TestCase):
             self.assertIn("idx_stop_times_stop_id_arrival_time", index_names)
             self.assertIn("idx_calendar_dates_date_service_id", index_names)
             self.assertIn("idx_calendar_start_date_end_date", index_names)
+
+    def test_enrich_route_realtime_ids_defaults_to_route_id_and_indexes_column(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.execute(
+                "CREATE TABLE routes (route_id TEXT, route_short_name TEXT)"
+            )
+            connection.executemany(
+                "INSERT INTO routes (route_id, route_short_name) VALUES (?, ?)",
+                [("R1", "1"), ("R2", "2")],
+            )
+
+            convert.enrich_route_realtime_ids(connection, "uta")
+
+            rows = connection.execute(
+                "SELECT route_id, route_rt_id FROM routes ORDER BY route_id"
+            ).fetchall()
+            index_names = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                ).fetchall()
+            }
+        finally:
+            connection.close()
+
+        self.assertEqual(rows, [("R1", "R1"), ("R2", "R2")])
+        self.assertIn("idx_routes_route_rt_id", index_names)
+
+    def test_enrich_route_realtime_ids_applies_pvta_route_details_mapping(self) -> None:
+        xml_payload = (
+            b"<ArrayOfRoute>"
+            b"<Route><RouteAbbreviation>B43</RouteAbbreviation><RouteId>10043</RouteId></Route>"
+            b"</ArrayOfRoute>"
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "pvta_routedetails.xml"
+            connection = sqlite3.connect(":memory:")
+            try:
+                connection.execute(
+                    "CREATE TABLE routes (route_id TEXT, route_short_name TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO routes (route_id, route_short_name) VALUES (?, ?)",
+                    [("B43", "B43"), ("R2", "2")],
+                )
+
+                with patch("scripts.convert.urlopen", return_value=BytesIO(xml_payload)):
+                    convert.enrich_route_realtime_ids(connection, "pvta", cache_path)
+
+                rows = connection.execute(
+                    "SELECT route_id, route_rt_id FROM routes ORDER BY route_id"
+                ).fetchall()
+            finally:
+                connection.close()
+
+            self.assertEqual(rows, [("B43", "10043"), ("R2", "R2")])
+            self.assertEqual(cache_path.read_bytes(), xml_payload)
+
+    def test_pvta_route_details_uses_cache_when_download_fails(self) -> None:
+        xml_payload = (
+            b"<ArrayOfRoute>"
+            b"<Route><RouteAbbreviation>B43</RouteAbbreviation><RouteId>10043</RouteId></Route>"
+            b"</ArrayOfRoute>"
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "pvta_routedetails.xml"
+            cache_path.write_bytes(xml_payload)
+
+            with patch("scripts.convert.urlopen", side_effect=URLError("offline")):
+                loaded_payload = convert.load_pvta_route_details_xml(cache_path)
+
+        self.assertEqual(loaded_payload, xml_payload)
 
     def test_build_http_request_uses_browser_user_agent(self) -> None:
         request = convert.build_http_request("https://example.test/feed.zip")

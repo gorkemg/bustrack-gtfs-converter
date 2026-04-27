@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from xml.etree import ElementTree
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -23,6 +24,8 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+PVTA_ROUTE_DETAILS_URL = "http://bustracker.pvta.com/InfoPoint/rest/routedetails/getallroutedetails"
+PVTA_ROUTE_DETAILS_CACHE_FILENAME = "pvta_routedetails.xml"
 
 INTEGER_COLUMN_NAMES = {
     "bikes_allowed",
@@ -104,6 +107,10 @@ def get_agencies_config_path() -> Path:
 
 def get_release_cache_path() -> Path:
     return get_repo_root() / "data" / "release_cache.json"
+
+
+def get_assets_cache_dir() -> Path:
+    return get_repo_root() / "internal" / "assets" / "cache"
 
 
 def load_agencies_config(config_path: Path) -> list[dict[str, str]]:
@@ -626,6 +633,169 @@ def import_gtfs_data(connection: sqlite3.Connection, gtfs_files: list[Path]) -> 
         LOGGER.info("Imported %d rows into %s", imported_rows, table_name)
 
 
+def list_table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = connection.execute(
+        f"PRAGMA table_info({quote_identifier(table_name)})"
+    ).fetchall()
+    return {str(row[1]) for row in rows}
+
+
+def table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def ensure_route_rt_id_column(connection: sqlite3.Connection) -> None:
+    columns = list_table_columns(connection, "routes")
+    if "route_rt_id" in columns:
+        return
+
+    connection.execute(
+        f"ALTER TABLE {quote_identifier('routes')} "
+        f"ADD COLUMN {quote_identifier('route_rt_id')} TEXT NOT NULL DEFAULT ''"
+    )
+
+
+def create_route_rt_id_index(connection: sqlite3.Connection) -> None:
+    index_name = build_index_name("routes", ("route_rt_id",))
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS "
+        f"{quote_identifier(index_name)} ON "
+        f"{quote_identifier('routes')} ({quote_identifier('route_rt_id')})"
+    )
+
+
+def xml_child_text(element: ElementTree.Element, child_name: str) -> str:
+    for child in list(element):
+        local_name = child.tag.rsplit("}", 1)[-1]
+        if local_name == child_name:
+            return (child.text or "").strip()
+    return ""
+
+
+def parse_pvta_route_details_mapping(xml_payload: bytes) -> dict[str, str]:
+    root = ElementTree.fromstring(xml_payload)
+    mapping: dict[str, str] = {}
+
+    for element in root.iter():
+        local_name = element.tag.rsplit("}", 1)[-1]
+        if local_name != "Route":
+            continue
+
+        route_abbreviation = xml_child_text(element, "RouteAbbreviation")
+        route_id = xml_child_text(element, "RouteId")
+        if route_abbreviation and route_id:
+            mapping[route_abbreviation] = route_id
+
+    return mapping
+
+
+def load_pvta_route_details_xml(cache_path: Path | None = None) -> bytes | None:
+    effective_cache_path = (
+        cache_path or get_assets_cache_dir() / PVTA_ROUTE_DETAILS_CACHE_FILENAME
+    )
+    request = build_http_request(PVTA_ROUTE_DETAILS_URL)
+
+    try:
+        LOGGER.info("Downloading PVTA route details from %s", PVTA_ROUTE_DETAILS_URL)
+        with urlopen(request, timeout=30) as response:
+            xml_payload = response.read()
+    except (OSError, URLError, HTTPError) as error:
+        LOGGER.warning("PVTA route details download failed: %s", error)
+        if not effective_cache_path.exists():
+            LOGGER.warning("PVTA route details cache is unavailable: %s", effective_cache_path)
+            return None
+
+        LOGGER.warning("Using cached PVTA route details XML: %s", effective_cache_path)
+        try:
+            return effective_cache_path.read_bytes()
+        except OSError as cache_error:
+            LOGGER.warning("PVTA route details cache could not be read: %s", cache_error)
+            return None
+
+    try:
+        effective_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        effective_cache_path.write_bytes(xml_payload)
+    except OSError as cache_error:
+        LOGGER.warning("PVTA route details XML could not be cached: %s", cache_error)
+    else:
+        LOGGER.info("Cached PVTA route details XML at %s", effective_cache_path)
+
+    return xml_payload
+
+
+def build_provider_route_rt_id_mapping(
+    agency_id: str, cache_path: Path | None = None
+) -> dict[str, str]:
+    if agency_id != "pvta":
+        return {}
+
+    xml_payload = load_pvta_route_details_xml(cache_path)
+    if xml_payload is None:
+        return {}
+
+    try:
+        mapping = parse_pvta_route_details_mapping(xml_payload)
+    except ElementTree.ParseError as error:
+        LOGGER.warning("PVTA route details XML could not be parsed: %s", error)
+        return {}
+
+    LOGGER.info("Loaded %d PVTA realtime route IDs", len(mapping))
+    return mapping
+
+
+def enrich_route_realtime_ids(
+    connection: sqlite3.Connection,
+    agency_id: str,
+    cache_path: Path | None = None,
+) -> None:
+    if not table_exists(connection, "routes"):
+        LOGGER.warning("Skipping route realtime ID enrichment because routes table is missing")
+        return
+
+    provider_mapping = build_provider_route_rt_id_mapping(agency_id, cache_path)
+
+    with connection:
+        ensure_route_rt_id_column(connection)
+        route_columns = list_table_columns(connection, "routes")
+        connection.execute(
+            f"UPDATE {quote_identifier('routes')} "
+            f"SET {quote_identifier('route_rt_id')} = COALESCE(CAST({quote_identifier('route_id')} AS TEXT), '')"
+        )
+
+        if provider_mapping:
+            match_columns = [
+                column_name
+                for column_name in ("route_short_name", "route_id")
+                if column_name in route_columns
+            ]
+            if match_columns:
+                where_clause = " OR ".join(
+                    f"{quote_identifier(column_name)} = ?" for column_name in match_columns
+                )
+                connection.executemany(
+                    f"UPDATE {quote_identifier('routes')} "
+                    f"SET {quote_identifier('route_rt_id')} = ? "
+                    f"WHERE {where_clause}",
+                    [
+                        (route_rt_id, *[route_abbreviation for _ in match_columns])
+                        for route_abbreviation, route_rt_id in provider_mapping.items()
+                    ],
+                )
+
+        connection.execute(
+            f"UPDATE {quote_identifier('routes')} "
+            f"SET {quote_identifier('route_rt_id')} = COALESCE(NULLIF({quote_identifier('route_rt_id')}, ''), "
+            f"COALESCE(CAST({quote_identifier('route_id')} AS TEXT), ''))"
+        )
+        create_route_rt_id_index(connection)
+
+    LOGGER.info("Initialized routes.route_rt_id for agency %s", agency_id)
+
+
 def read_first_csv_row(file_path: Path) -> dict[str, str] | None:
     if not file_path.exists():
         return None
@@ -933,6 +1103,13 @@ def main() -> int:
         import_gtfs_data(connection, gtfs_files)
     except (OSError, ValueError, sqlite3.Error) as error:
         LOGGER.error("Failed to import GTFS data: %s", error)
+        connection.close()
+        return 1
+
+    try:
+        enrich_route_realtime_ids(connection, args.agency or input_path.name)
+    except (OSError, ValueError, sqlite3.Error) as error:
+        LOGGER.error("Failed to enrich route realtime IDs: %s", error)
         connection.close()
         return 1
 
