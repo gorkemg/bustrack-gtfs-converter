@@ -83,6 +83,15 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Restore External Resource Cache
+        uses: actions/cache@v4
+        with:
+          path: internal/assets/cache
+          key: external-resource-cache-${{ matrix.agency }}-${{ github.run_id }}
+          restore-keys: |
+            external-resource-cache-${{ matrix.agency }}-
+            external-resource-cache-
+
       - name: Prepare Timestamp
         id: timestamp
         run: |

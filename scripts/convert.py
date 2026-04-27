@@ -25,7 +25,8 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 PVTA_ROUTE_DETAILS_URL = "http://bustracker.pvta.com/InfoPoint/rest/routedetails/getallroutedetails"
-PVTA_ROUTE_DETAILS_CACHE_FILENAME = "pvta_routedetails.xml"
+CACHE_DIR_RELATIVE_PATH = Path("internal") / "assets" / "cache"
+PVTA_ROUTE_DETAILS_CACHE_RELATIVE_PATH = CACHE_DIR_RELATIVE_PATH / "pvta_routedetails.xml"
 
 INTEGER_COLUMN_NAMES = {
     "bikes_allowed",
@@ -110,7 +111,11 @@ def get_release_cache_path() -> Path:
 
 
 def get_assets_cache_dir() -> Path:
-    return get_repo_root() / "internal" / "assets" / "cache"
+    return get_repo_root() / CACHE_DIR_RELATIVE_PATH
+
+
+def get_pvta_route_details_cache_path() -> Path:
+    return get_repo_root() / PVTA_ROUTE_DETAILS_CACHE_RELATIVE_PATH
 
 
 def load_agencies_config(config_path: Path) -> list[dict[str, str]]:
@@ -677,7 +682,25 @@ def xml_child_text(element: ElementTree.Element, child_name: str) -> str:
 
 
 def parse_pvta_route_details_mapping(xml_payload: bytes) -> dict[str, str]:
-    root = ElementTree.fromstring(xml_payload)
+    try:
+        root = ElementTree.fromstring(xml_payload)
+    except ElementTree.ParseError:
+        payload = json.loads(xml_payload.decode("utf-8-sig"))
+        if not isinstance(payload, list):
+            raise
+
+        mapping: dict[str, str] = {}
+        for route in payload:
+            if not isinstance(route, dict):
+                continue
+
+            route_abbreviation = str(route.get("RouteAbbreviation") or "").strip()
+            route_id = str(route.get("RouteId") or "").strip()
+            if route_abbreviation and route_id:
+                mapping[route_abbreviation] = route_id
+
+        return mapping
+
     mapping: dict[str, str] = {}
 
     for element in root.iter():
@@ -694,9 +717,7 @@ def parse_pvta_route_details_mapping(xml_payload: bytes) -> dict[str, str]:
 
 
 def load_pvta_route_details_xml(cache_path: Path | None = None) -> bytes | None:
-    effective_cache_path = (
-        cache_path or get_assets_cache_dir() / PVTA_ROUTE_DETAILS_CACHE_FILENAME
-    )
+    effective_cache_path = cache_path or get_pvta_route_details_cache_path()
     request = build_http_request(PVTA_ROUTE_DETAILS_URL)
 
     try:
@@ -1021,7 +1042,7 @@ def main() -> int:
     upstream_metadata: dict[str, str] | None = None
     should_download = False
     release_check_failed = False
-    if args.agency and gtfs_url:
+    if args.agency and gtfs_url and args.input_path is None:
         if args.force_update:
             should_download = True
             LOGGER.info(

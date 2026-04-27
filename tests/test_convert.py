@@ -184,6 +184,14 @@ class ConvertTests(unittest.TestCase):
             self.assertIn("idx_calendar_dates_date_service_id", index_names)
             self.assertIn("idx_calendar_start_date_end_date", index_names)
 
+    def test_pvta_route_details_cache_path_is_project_relative(self) -> None:
+        cache_path = convert.get_pvta_route_details_cache_path()
+
+        self.assertEqual(
+            cache_path,
+            convert.get_repo_root() / "internal" / "assets" / "cache" / "pvta_routedetails.xml",
+        )
+
     def test_enrich_route_realtime_ids_defaults_to_route_id_and_indexes_column(self) -> None:
         connection = sqlite3.connect(":memory:")
         try:
@@ -242,6 +250,13 @@ class ConvertTests(unittest.TestCase):
 
             self.assertEqual(rows, [("B43", "10043"), ("R2", "R2")])
             self.assertEqual(cache_path.read_bytes(), xml_payload)
+
+    def test_parse_pvta_route_details_mapping_accepts_json_payload(self) -> None:
+        payload = b'[{"RouteAbbreviation":"B43","RouteId":10043}]'
+
+        mapping = convert.parse_pvta_route_details_mapping(payload)
+
+        self.assertEqual(mapping, {"B43": "10043"})
 
     def test_pvta_route_details_uses_cache_when_download_fails(self) -> None:
         xml_payload = (
@@ -492,6 +507,71 @@ class ConvertTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue(output_path.exists())
             self.assertTrue(output_path.with_suffix(".sqlite.zip").exists())
+
+    def test_main_uses_agency_for_local_folder_without_remote_update_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            csv_dir = temp_root / "google_transit_2"
+            csv_dir.mkdir()
+            (csv_dir / "routes.txt").write_text(
+                "route_id,route_short_name\nB43,B43\nR2,2\n",
+                encoding="utf-8",
+            )
+            (csv_dir / "stops.txt").write_text(
+                "stop_id,stop_name,stop_lat,stop_lon\n1,Stop A,1.0,2.0\n",
+                encoding="utf-8",
+            )
+            (csv_dir / "trips.txt").write_text(
+                "route_id,service_id,trip_id,trip_headsign,shape_id\nB43,S1,T1,Headsign,SH1\n",
+                encoding="utf-8",
+            )
+            (csv_dir / "stop_times.txt").write_text(
+                "trip_id,arrival_time,stop_id,stop_sequence\nT1,08:00:00,1,1\n",
+                encoding="utf-8",
+            )
+            output_path = temp_root / "pvta.sqlite"
+            xml_payload = (
+                b"<ArrayOfRoute>"
+                b"<Route><RouteAbbreviation>B43</RouteAbbreviation><RouteId>10043</RouteId></Route>"
+                b"</ArrayOfRoute>"
+            )
+
+            with patch(
+                "scripts.convert.load_agencies_config",
+                return_value=[{"id": "pvta", "url": "https://example.test/pvta.zip"}],
+            ):
+                with patch(
+                    "scripts.convert.needs_update",
+                    side_effect=AssertionError("local input_path must not run remote update check"),
+                ):
+                    with patch(
+                        "scripts.convert.get_pvta_route_details_cache_path",
+                        return_value=temp_root / "cache" / "pvta_routedetails.xml",
+                    ):
+                        with patch("scripts.convert.urlopen", return_value=BytesIO(xml_payload)):
+                            with patch(
+                                "sys.argv",
+                                [
+                                    "convert.py",
+                                    str(csv_dir),
+                                    "--agency",
+                                    "pvta",
+                                    "--output",
+                                    str(output_path),
+                                ],
+                            ):
+                                exit_code = convert.main()
+
+            connection = sqlite3.connect(output_path)
+            try:
+                rows = connection.execute(
+                    "SELECT route_id, route_rt_id FROM routes ORDER BY route_id"
+                ).fetchall()
+            finally:
+                connection.close()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(rows, [("B43", "10043"), ("R2", "R2")])
 
     def test_main_forces_download_when_release_check_fails_and_folder_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
