@@ -251,12 +251,71 @@ class ConvertTests(unittest.TestCase):
             self.assertEqual(rows, [("B43", "10043"), ("R2", "R2")])
             self.assertEqual(cache_path.read_bytes(), xml_payload)
 
+    def test_enrich_route_realtime_ids_uses_normalized_short_name_matching_priority(self) -> None:
+        xml_payload = (
+            b"<ArrayOfRoute>"
+            b"<Route><RouteAbbreviation>B43</RouteAbbreviation><ShortName> B 43 </ShortName><RouteId>10043</RouteId></Route>"
+            b"<Route><RouteAbbreviation>T1</RouteAbbreviation><ShortName>801</ShortName><RouteId>20801</RouteId></Route>"
+            b"</ArrayOfRoute>"
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "pvta_routedetails.xml"
+            connection = sqlite3.connect(":memory:")
+            try:
+                connection.execute(
+                    "CREATE TABLE routes (route_id TEXT, route_short_name TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO routes (route_id, route_short_name) VALUES (?, ?)",
+                    [(" b43 ", "unused"), ("801", "T1"), ("LOCAL801", " 8 0 1 "), ("T1", "misc")],
+                )
+
+                with patch("scripts.convert.urlopen", return_value=BytesIO(xml_payload)):
+                    convert.enrich_route_realtime_ids(connection, "pvta", cache_path)
+
+                rows = connection.execute(
+                    "SELECT route_id, route_short_name, route_rt_id FROM routes ORDER BY route_id"
+                ).fetchall()
+            finally:
+                connection.close()
+
+        self.assertEqual(
+            rows,
+            [
+                (" b43 ", "unused", "10043"),
+                ("801", "T1", "20801"),
+                ("LOCAL801", " 8 0 1 ", "20801"),
+                ("T1", "misc", "20801"),
+            ],
+        )
+
     def test_parse_pvta_route_details_mapping_accepts_json_payload(self) -> None:
         payload = b'[{"RouteAbbreviation":"B43","RouteId":10043}]'
 
         mapping = convert.parse_pvta_route_details_mapping(payload)
 
         self.assertEqual(mapping, {"B43": "10043"})
+
+    def test_parse_pvta_route_details_records_reads_short_name(self) -> None:
+        payload = (
+            b"<ArrayOfRoute>"
+            b"<Route><RouteAbbreviation>B43</RouteAbbreviation><ShortName>943</ShortName><RouteId>10043</RouteId></Route>"
+            b"</ArrayOfRoute>"
+        )
+
+        records = convert.parse_pvta_route_details_records(payload)
+
+        self.assertEqual(
+            records,
+            [
+                {
+                    "route_rt_id": "10043",
+                    "route_abbreviation": "B43",
+                    "short_name": "943",
+                }
+            ],
+        )
 
     def test_pvta_route_details_uses_cache_when_download_fails(self) -> None:
         xml_payload = (

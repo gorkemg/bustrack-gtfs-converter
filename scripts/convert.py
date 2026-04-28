@@ -681,7 +681,13 @@ def xml_child_text(element: ElementTree.Element, child_name: str) -> str:
     return ""
 
 
-def parse_pvta_route_details_mapping(xml_payload: bytes) -> dict[str, str]:
+def normalize_route_match_key(value: str | None) -> str:
+    if value is None:
+        return ""
+    return "".join(value.split()).upper()
+
+
+def parse_pvta_route_details_records(xml_payload: bytes) -> list[dict[str, str]]:
     try:
         root = ElementTree.fromstring(xml_payload)
     except ElementTree.ParseError:
@@ -689,30 +695,54 @@ def parse_pvta_route_details_mapping(xml_payload: bytes) -> dict[str, str]:
         if not isinstance(payload, list):
             raise
 
-        mapping: dict[str, str] = {}
+        records: list[dict[str, str]] = []
         for route in payload:
             if not isinstance(route, dict):
                 continue
 
-            route_abbreviation = str(route.get("RouteAbbreviation") or "").strip()
             route_id = str(route.get("RouteId") or "").strip()
-            if route_abbreviation and route_id:
-                mapping[route_abbreviation] = route_id
+            route_abbreviation = str(route.get("RouteAbbreviation") or "").strip()
+            short_name = str(route.get("ShortName") or "").strip()
+            if route_id:
+                records.append(
+                    {
+                        "route_rt_id": route_id,
+                        "route_abbreviation": route_abbreviation,
+                        "short_name": short_name,
+                    }
+                )
 
-        return mapping
+        return records
 
-    mapping: dict[str, str] = {}
+    records: list[dict[str, str]] = []
 
     for element in root.iter():
         local_name = element.tag.rsplit("}", 1)[-1]
         if local_name != "Route":
             continue
 
-        route_abbreviation = xml_child_text(element, "RouteAbbreviation")
         route_id = xml_child_text(element, "RouteId")
-        if route_abbreviation and route_id:
-            mapping[route_abbreviation] = route_id
+        route_abbreviation = xml_child_text(element, "RouteAbbreviation")
+        short_name = xml_child_text(element, "ShortName")
+        if route_id:
+            records.append(
+                {
+                    "route_rt_id": route_id,
+                    "route_abbreviation": route_abbreviation,
+                    "short_name": short_name,
+                }
+            )
 
+    return records
+
+
+def parse_pvta_route_details_mapping(xml_payload: bytes) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for record in parse_pvta_route_details_records(xml_payload):
+        route_abbreviation = record.get("route_abbreviation", "")
+        route_rt_id = record.get("route_rt_id", "")
+        if route_abbreviation and route_rt_id:
+            mapping[route_abbreviation] = route_rt_id
     return mapping
 
 
@@ -748,24 +778,24 @@ def load_pvta_route_details_xml(cache_path: Path | None = None) -> bytes | None:
     return xml_payload
 
 
-def build_provider_route_rt_id_mapping(
+def build_provider_route_rt_id_records(
     agency_id: str, cache_path: Path | None = None
-) -> dict[str, str]:
+) -> list[dict[str, str]]:
     if agency_id != "pvta":
-        return {}
+        return []
 
     xml_payload = load_pvta_route_details_xml(cache_path)
     if xml_payload is None:
-        return {}
+        return []
 
     try:
-        mapping = parse_pvta_route_details_mapping(xml_payload)
-    except ElementTree.ParseError as error:
-        LOGGER.warning("PVTA route details XML could not be parsed: %s", error)
-        return {}
+        records = parse_pvta_route_details_records(xml_payload)
+    except (ElementTree.ParseError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        LOGGER.warning("PVTA route details payload could not be parsed: %s", error)
+        return []
 
-    LOGGER.info("Loaded %d PVTA realtime route IDs", len(mapping))
-    return mapping
+    LOGGER.info("Loaded %d PVTA realtime route records", len(records))
+    return records
 
 
 def enrich_route_realtime_ids(
@@ -777,7 +807,7 @@ def enrich_route_realtime_ids(
         LOGGER.warning("Skipping route realtime ID enrichment because routes table is missing")
         return
 
-    provider_mapping = build_provider_route_rt_id_mapping(agency_id, cache_path)
+    provider_records = build_provider_route_rt_id_records(agency_id, cache_path)
 
     with connection:
         ensure_route_rt_id_column(connection)
@@ -787,24 +817,75 @@ def enrich_route_realtime_ids(
             f"SET {quote_identifier('route_rt_id')} = COALESCE(CAST({quote_identifier('route_id')} AS TEXT), '')"
         )
 
-        if provider_mapping:
-            match_columns = [
-                column_name
-                for column_name in ("route_short_name", "route_id")
-                if column_name in route_columns
-            ]
-            if match_columns:
-                where_clause = " OR ".join(
-                    f"{quote_identifier(column_name)} = ?" for column_name in match_columns
+        if provider_records:
+            short_name_map: dict[str, str] = {}
+            route_abbreviation_map: dict[str, str] = {}
+            for record in provider_records:
+                route_rt_id = record.get("route_rt_id", "")
+                normalized_short_name = normalize_route_match_key(record.get("short_name"))
+                normalized_route_abbreviation = normalize_route_match_key(
+                    record.get("route_abbreviation")
                 )
+                if route_rt_id and normalized_short_name:
+                    short_name_map[normalized_short_name] = route_rt_id
+                if route_rt_id and normalized_route_abbreviation:
+                    route_abbreviation_map[normalized_route_abbreviation] = route_rt_id
+
+            select_columns = ["rowid", "route_id"]
+            if "route_short_name" in route_columns:
+                select_columns.append("route_short_name")
+            route_rows = connection.execute(
+                "SELECT "
+                + ", ".join(quote_identifier(column_name) for column_name in select_columns)
+                + f" FROM {quote_identifier('routes')}"
+            ).fetchall()
+
+            route_rt_id_updates: list[tuple[str, int]] = []
+            for route_row in route_rows:
+                rowid = int(route_row[0])
+                route_id = "" if route_row[1] is None else str(route_row[1])
+                route_short_name = ""
+                if len(route_row) > 2 and route_row[2] is not None:
+                    route_short_name = str(route_row[2])
+
+                normalized_route_id = normalize_route_match_key(route_id)
+                normalized_route_short_name = normalize_route_match_key(route_short_name)
+
+                matched_route_rt_id = ""
+                match_level = ""
+                matched_value = ""
+
+                if normalized_route_id in short_name_map:
+                    matched_route_rt_id = short_name_map[normalized_route_id]
+                    match_level = "level_1_route_id_to_short_name"
+                    matched_value = normalized_route_id
+                elif normalized_route_short_name in short_name_map:
+                    matched_route_rt_id = short_name_map[normalized_route_short_name]
+                    match_level = "level_2_route_short_name_to_short_name"
+                    matched_value = normalized_route_short_name
+                elif normalized_route_id in route_abbreviation_map:
+                    matched_route_rt_id = route_abbreviation_map[normalized_route_id]
+                    match_level = "level_3_route_id_to_route_abbreviation"
+                    matched_value = normalized_route_id
+
+                if matched_route_rt_id:
+                    route_rt_id_updates.append((matched_route_rt_id, rowid))
+                    if matched_route_rt_id != route_id:
+                        LOGGER.info(
+                            "PVTA route realtime mapping applied: route_id=%s, route_short_name=%s, route_rt_id=%s, match_level=%s, matched_value=%s",
+                            route_id,
+                            route_short_name,
+                            matched_route_rt_id,
+                            match_level,
+                            matched_value,
+                        )
+
+            if route_rt_id_updates:
                 connection.executemany(
                     f"UPDATE {quote_identifier('routes')} "
                     f"SET {quote_identifier('route_rt_id')} = ? "
-                    f"WHERE {where_clause}",
-                    [
-                        (route_rt_id, *[route_abbreviation for _ in match_columns])
-                        for route_abbreviation, route_rt_id in provider_mapping.items()
-                    ],
+                    "WHERE rowid = ?",
+                    route_rt_id_updates,
                 )
 
         connection.execute(
@@ -813,6 +894,26 @@ def enrich_route_realtime_ids(
             f"COALESCE(CAST({quote_identifier('route_id')} AS TEXT), ''))"
         )
         create_route_rt_id_index(connection)
+
+        verification_short_name_sql = "''"
+        if "route_short_name" in route_columns:
+            verification_short_name_sql = (
+                f"COALESCE({quote_identifier('route_short_name')}, '')"
+            )
+        for route_id, route_short_name, route_rt_id in connection.execute(
+            f"SELECT {quote_identifier('route_id')}, "
+            f"{verification_short_name_sql}, "
+            f"{quote_identifier('route_rt_id')} "
+            f"FROM {quote_identifier('routes')} "
+            f"WHERE {quote_identifier('route_rt_id')} != COALESCE(CAST({quote_identifier('route_id')} AS TEXT), '') "
+            f"ORDER BY {quote_identifier('route_id')}"
+        ).fetchall():
+            LOGGER.info(
+                "PVTA route realtime ID verified: route_id=%s, route_short_name=%s, route_rt_id=%s",
+                route_id,
+                route_short_name,
+                route_rt_id,
+            )
 
     LOGGER.info("Initialized routes.route_rt_id for agency %s", agency_id)
 
