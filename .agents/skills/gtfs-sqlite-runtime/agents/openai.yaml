@@ -1,0 +1,4 @@
+interface:
+  display_name: "GTFS SQLite Runtime"
+  short_description: "Inspect and load generated GTFS SQLite artifacts"
+  default_prompt: "Use $gtfs-sqlite-runtime when working with this repository's generated SQLite GTFS files, app_metadata validation, route_rt_id handling, release asset URLs, or app-side loading on iOS, Android, or web."
