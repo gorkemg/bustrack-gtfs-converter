@@ -83,14 +83,19 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Prepare External Cache Period
+        if: matrix.agency == 'pvta'
+        run: |
+          echo "EXTERNAL_CACHE_PERIOD=$(date -u +'%Y-%m')" >> "$GITHUB_ENV"
+
       - name: Restore External Resource Cache
+        if: matrix.agency == 'pvta'
         uses: actions/cache@v4
         with:
-          path: internal/assets/cache
-          key: external-resource-cache-${{ matrix.agency }}-${{ github.run_id }}
+          path: internal/assets/cache/pvta_routedetails.xml
+          key: external-resource-cache-${{ matrix.agency }}-${{ env.EXTERNAL_CACHE_PERIOD }}
           restore-keys: |
             external-resource-cache-${{ matrix.agency }}-
-            external-resource-cache-
 
       - name: Prepare Timestamp
         id: timestamp
@@ -112,14 +117,6 @@ jobs:
           fi
           python scripts/convert.py --agency ${{ matrix.agency }} --cleanup-extracted $FORCE_UPDATE_ARGS 2>&1 | tee logs/${{ matrix.agency }}.log
 
-      - name: Upload Converter Log
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: converter-log-${{ matrix.agency }}
-          path: logs/${{ matrix.agency }}.log
-          if-no-files-found: ignore
-
       - name: Check if SQLite archive was created
         id: check_file
         run: |
@@ -129,13 +126,15 @@ jobs:
             echo "created=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload SQLite Archive Artifact
-        if: steps.check_file.outputs.created == 'true'
+      - name: Upload Converter Log
+        if: always() && (steps.converter.outcome != 'success' || steps.check_file.outputs.created != 'true')
         uses: actions/upload-artifact@v7
         with:
-          name: sqlite-archive-${{ matrix.agency }}
-          path: data/${{ matrix.agency }}.sqlite.zip
-          if-no-files-found: error
+          name: converter-log-${{ matrix.agency }}
+          path: logs/${{ matrix.agency }}.log
+          if-no-files-found: ignore
+          retention-days: 1
+          compression-level: 9
 
       - name: Check if Release Notes were created
         id: check_release_notes
