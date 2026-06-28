@@ -8,6 +8,8 @@ This repository converts each GTFS `.txt` file into a SQLite table with the same
 - `stop_times.txt` -> `stop_times`
 - and so on for every discovered GTFS `.txt` file
 
+Because the import walks the feed's actually present `.txt` files and preserves header-defined columns, two agencies do not necessarily produce identical SQLite schemas. Table presence, column presence, row counts, and some indexes can legitimately vary across agencies and across feed revisions of the same agency.
+
 ## Import behavior
 
 - Table names come from filenames without `.txt`.
@@ -93,6 +95,22 @@ PVTA matching priority:
 3. GTFS `routes.route_id` -> provider `RouteAbbreviation`
 
 If no PVTA match is found, `route_rt_id` falls back to `route_id`.
+
+## Why agency artifacts differ
+
+Agency-specific SQLite differences are expected, not an error condition.
+
+Primary drivers:
+
+- Different agencies publish different optional GTFS files, so one database may include tables that another does not.
+- Different agencies publish different header sets inside the same GTFS file class, so column sets may diverge.
+- Feed size and service modeling vary, so row counts, file sizes, and date coverage differ.
+- The converter only creates indexes whose required columns exist, so index sets can vary slightly with schema shape.
+- `pvta` has provider-specific realtime route ID enrichment for `routes.route_rt_id`; most other agencies simply retain `route_id` semantics in that field.
+
+Practical consequence:
+
+- client code should verify table and column existence for agency-specific queries rather than assuming one monolithic canonical schema
 
 ## Recommended indexes
 

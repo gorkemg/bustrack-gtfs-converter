@@ -27,6 +27,30 @@ To ensure zero-downtime and high reliability for mobile end-users, this reposito
 
 The repository does not rely on GitHub's global `Latest` badge. Clients are expected to fetch explicit agency tags such as `pvta` or `uta`.
 
+### Sync Cadence and Release Timing
+
+The scheduled sync workflow uses the cron expression `15 4 * * 0,3,5`. In nominal UTC terms, the repository checks for upstream GTFS updates at:
+
+- Sunday `04:15 UTC`
+- Wednesday `04:15 UTC`
+- Friday `04:15 UTC`
+
+That yields a deterministic `3-2-2` day cadence, which is why the project can be described as running "roughly every 2-3 days".
+
+Operationally important caveats:
+
+- GitHub Actions scheduled workflows are not a hard real-time scheduler. The run may start later than the cron expression, especially under platform load or queue contention.
+- The cron timestamp should therefore be treated as the earliest intended check time, not as a guaranteed publication timestamp.
+- Releases are only created for an agency when the converter actually produces a new `.sqlite.zip` artifact. If upstream source metadata indicates no change, the scheduled run may complete without publishing a fresh release.
+- When a run does publish, archive tags such as `{agency}-YYYYMMDD-HHMM` use the workflow's UTC execution timestamp, so observed release times typically cluster shortly after the scheduled check window, but with GitHub-induced delay and per-agency matrix runtime variance.
+
+For consumers that want to poll after the repository, the robust strategy is:
+
+- anchor downstream polling to the nominal `04:15 UTC` schedule
+- add tolerance for GitHub scheduling delay
+- add tolerance for converter runtime and per-agency matrix execution
+- avoid assuming that a new release exists immediately at `04:15 UTC`
+
 ---
 
 ## Metadata Specification (`app_metadata`)
@@ -76,6 +100,25 @@ To integrate a new transit agency, append its configuration to `config/agencies.
 That is sufficient for normal operation. The sync workflow derives its agency matrix directly from `config/agencies.json`, and a push to that file also triggers the workflow.
 
 The rollback workflow also validates the entered agency ID against `config/agencies.json`, so no workflow edits are required when onboarding a new agency.
+
+### Agency-Specific SQLite Differences
+
+Generated SQLite artifacts are intentionally not identical across agencies. The main reasons are upstream GTFS heterogeneity and one repository-specific enrichment path.
+
+Differences that consumers should expect:
+
+- Table presence can vary because the converter imports every discovered GTFS `.txt` file. If one agency publishes `calendar_dates.txt`, `fare_attributes.txt`, or other optional GTFS files and another does not, the resulting SQLite table set will differ.
+- Column presence can vary because table schemas are derived directly from each feed's CSV headers. Optional GTFS columns and agency-specific feed extensions therefore propagate into the SQLite schema.
+- Row counts, file size, and service date coverage vary with the upstream schedule content, service calendar horizon, and feed modeling choices.
+- Index coverage can vary slightly because indexes are only created when the required table and column combination exists.
+- `routes.route_rt_id` semantics vary by agency. For most agencies it mirrors `route_id`; for `pvta` the converter attempts provider-specific realtime ID enrichment from PVTA's route details feed.
+- `app_metadata` values always differ per artifact, including `agency_id`, build provenance, and feed validity dates.
+
+Implication for clients and agents:
+
+- do not assume one fixed global schema beyond the repository's documented invariants
+- validate `app_metadata.agency_id` before activation
+- inspect table and column availability per agency when implementing raw SQL or generated models
 
 ## Manual Emergency Rollback
 

@@ -16,6 +16,16 @@ Use this skill for any task that touches the generated `.sqlite` or `.sqlite.zip
 - The converter also adds `routes.route_rt_id`, which does not exist in standard GTFS.
 - The converter creates app-oriented indexes, but it does not add GTFS foreign keys or primary key constraints.
 - Release assets are published by agency tag, not via a generic "latest" release contract.
+- Scheduled upstream update checks run on a fixed UTC cadence, but GitHub Actions scheduling is best-effort rather than punctual.
+
+## Sync cadence and release expectations
+
+- The scheduled workflow cron is `15 4 * * 0,3,5`.
+- Nominal upstream GTFS check times are Sunday, Wednesday, and Friday at `04:15 UTC`.
+- The effective cadence is `3-2-2` days, so "roughly every 2-3 days" is accurate.
+- GitHub Actions may start a scheduled run later than the cron expression. Treat `04:15 UTC` as the intended check window, not as a guaranteed release publication time.
+- A scheduled run does not imply a new release. The converter only publishes a new agency artifact when the upstream feed metadata indicates a change, or when the workflow is manually forced.
+- Archive tags such as `{agency}-YYYYMMDD-HHMM` reflect the workflow's UTC execution timestamp, so observed release times usually appear shortly after the scheduled window, but with GitHub queue delay and matrix-runtime variance.
 
 Read [references/schema.md](references/schema.md) for schema and GTFS differences.
 Read [references/platforms-and-urls.md](references/platforms-and-urls.md) for runtime loading, verification queries, platform examples, and release URL patterns.
@@ -24,13 +34,18 @@ Read [references/platforms-and-urls.md](references/platforms-and-urls.md) for ru
 
 1. Identify the agency and whether the task is about a local file or a published release asset.
 2. Verify whether the artifact is `.sqlite` or `.sqlite.zip`. If zipped, unzip before opening with SQLite APIs.
-3. Validate `app_metadata` before switching an app to a freshly downloaded database.
-4. Treat `route_rt_id` as the stable app-side/realtime join key when available; do not assume GTFS `route_id` is the provider's realtime route identifier.
-5. Keep GTFS caveats in mind:
+3. If timing matters, reason from the nominal check window plus GitHub delay. Do not promise that a new release exists exactly at `04:15 UTC`.
+4. Validate `app_metadata` before switching an app to a freshly downloaded database.
+5. Treat `route_rt_id` as the stable app-side/realtime join key when available; do not assume GTFS `route_id` is the provider's realtime route identifier.
+6. Keep GTFS caveats in mind:
    - GTFS dates such as `start_date` stay as `TEXT` in `YYYYMMDD`.
    - GTFS times remain `TEXT` and may exceed `24:00:00`.
    - No foreign keys are enforced by SQLite in this generated database.
-6. When writing client code, prefer copying the database to an app-controlled writable path before opening it.
+7. Expect agency-specific schema variance:
+   - optional GTFS files may create or omit entire tables
+   - differing CSV headers may create or omit columns
+   - provider-specific enrichment may change `route_rt_id` semantics for a subset of agencies such as `pvta`
+8. When writing client code, prefer copying the database to an app-controlled writable path before opening it.
 
 ## Quick inspection commands
 
@@ -51,3 +66,5 @@ sqlite3 data/pvta.sqlite "SELECT name, sql FROM sqlite_master WHERE type IN ('ta
 - Do not coerce GTFS time strings into naive local datetimes.
 - Do not assume release discovery via "latest". Use explicit tags such as `pvta`, `pvta-previous`, or `pvta-YYYYMMDD-HHMM`.
 - Do not assume the database enforces relational integrity for you.
+- Do not assume all agencies expose the same table set, column set, or `route_rt_id` behavior.
+- Do not tell other agents to poll exactly at the cron timestamp without allowing for GitHub scheduler lag.

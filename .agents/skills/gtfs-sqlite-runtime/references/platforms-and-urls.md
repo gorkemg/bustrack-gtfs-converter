@@ -8,6 +8,14 @@ Repository:
 
 - `gorkemg/bustrack-gtfs-converter`
 
+Scheduled sync cadence:
+
+- cron: `15 4 * * 0,3,5`
+- nominal check window: Sunday, Wednesday, and Friday at `04:15 UTC`
+- effective cadence: roughly every `2-3` days
+- GitHub Actions `schedule` is best-effort, so runs may begin later than `04:15 UTC`
+- release publication time therefore trails the nominal check window by GitHub queue delay plus workflow runtime
+
 Tag strategy:
 
 - production: `{agency}`
@@ -40,6 +48,7 @@ Important:
 - Do not rely on GitHub's generic `latest` release URL.
 - Select the asset by explicit tag and agency.
 - Treat `.sqlite.zip` as the distribution format and unzip before opening with SQLite libraries.
+- Do not assume a new release exists exactly at the cron timestamp; poll with a buffer after the nominal window.
 
 ## Validation before activation
 
