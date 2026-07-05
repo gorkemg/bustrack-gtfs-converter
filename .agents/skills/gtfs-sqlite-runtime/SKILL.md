@@ -14,6 +14,7 @@ Use this skill for any task that touches the generated `.sqlite` or `.sqlite.zip
 - Empty CSV values are imported as `NULL`.
 - The converter adds a project-specific `app_metadata` table.
 - The converter also adds `routes.route_rt_id`, which does not exist in standard GTFS.
+- The converter derives project-specific `canonical_routes` and `canonical_route_stops` tables (schema_version >= 1.1): one merged, maximum-extent stop ordering per `(route_id, direction_id)` with `progress_ratio` values from `0.0` to `1.0` for linear UI rendering.
 - The converter creates app-oriented indexes, but it does not add GTFS foreign keys or primary key constraints.
 - Release assets are published by agency tag, not via a generic "latest" release contract.
 - Scheduled upstream update checks run on a fixed UTC cadence, but GitHub Actions scheduling is best-effort rather than punctual.

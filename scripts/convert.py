@@ -4,11 +4,13 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 import shutil
 import sqlite3
 import uuid
 import zipfile
+from collections import Counter
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -20,6 +22,7 @@ from urllib.request import Request, urlopen
 
 LOGGER = logging.getLogger("gtfs_converter")
 IMPORT_CHUNK_SIZE = 5000
+EARTH_RADIUS_METERS = 6371000.0
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -954,7 +957,7 @@ def create_app_metadata(
     connection: sqlite3.Connection,
     input_path: Path,
     agency_id: str,
-    schema_version: str = "1.0",
+    schema_version: str = "1.1",
 ) -> None:
     feed_start_date, feed_end_date = extract_feed_date_range(input_path)
     metadata_rows = [
@@ -1054,6 +1057,581 @@ def create_recommended_indexes(
                 created_indexes += 1
 
     LOGGER.info("Created %d recommended indexes", created_indexes)
+
+
+# ---------------------------------------------------------------------------
+# Canonical routes (topological superset)
+#
+# A single (route_id, direction_id) usually carries several trip variants:
+# the full pattern plus short-turn trips that cover only a subsequence of it.
+# Linear UI components (e.g. Live Activity progress bars) need exactly one
+# maximum-extent stop ordering per direction. We obtain it by merging every
+# trip variant into one directed graph and flattening that graph with a
+# topological sort — the "topological superset".
+# ---------------------------------------------------------------------------
+
+
+def haversine_distance_meters(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> float:
+    """Great-circle distance between two WGS84 coordinates in meters."""
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+
+    # Haversine formula: a is the squared half-chord length between the points.
+    a = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon / 2) ** 2
+    )
+    return 2 * EARTH_RADIUS_METERS * math.asin(math.sqrt(a))
+
+
+def build_stop_graph(
+    trip_stop_sequences: list[list[str]],
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
+    """Merge all trip stop sequences of one direction into a weighted digraph.
+
+    Graph model:
+      - Nodes are unique stop_ids.
+      - A directed edge u -> v exists when some trip serves v immediately
+        after u. Its weight counts how many trips traverse u -> v; this
+        frequency later drives cycle breaking and tie-breaking.
+      - Short-turn trips are subpaths of the full pattern, so merging them
+        adds no new structure — only extra edge weight on the trunk. The
+        merged graph is therefore acyclic for plain linear routes; cycles
+        only appear through loop routes or feed anomalies.
+
+    Returns forward and reverse adjacency dicts (adjacency[u][v] == weight and
+    reverse_adjacency[v][u] == weight). Adjacency dicts give O(1) edge updates
+    and O(V + E) traversal without materializing an O(V^2) matrix.
+    """
+    adjacency: dict[str, dict[str, int]] = {}
+    reverse_adjacency: dict[str, dict[str, int]] = {}
+
+    for stop_ids in trip_stop_sequences:
+        for stop_id in stop_ids:
+            adjacency.setdefault(stop_id, {})
+            reverse_adjacency.setdefault(stop_id, {})
+
+        for previous_stop_id, next_stop_id in zip(stop_ids, stop_ids[1:]):
+            # A stop repeated back-to-back would form a self-loop, which can
+            # never be part of a topological order — skip it.
+            if previous_stop_id == next_stop_id:
+                continue
+            adjacency[previous_stop_id][next_stop_id] = (
+                adjacency[previous_stop_id].get(next_stop_id, 0) + 1
+            )
+            reverse_adjacency[next_stop_id][previous_stop_id] = (
+                reverse_adjacency[next_stop_id].get(previous_stop_id, 0) + 1
+            )
+
+    return adjacency, reverse_adjacency
+
+
+def remove_cycle_edges(
+    adjacency: dict[str, dict[str, int]],
+    reverse_adjacency: dict[str, dict[str, int]],
+) -> list[tuple[str, str, int]]:
+    """Break every cycle by greedily deleting minimum-weight edges in place.
+
+    A topological order exists only for a DAG. Loop routes and feed anomalies
+    can introduce cycles, so we apply a greedy minimum-feedback-arc heuristic:
+    the lowest-frequency edge inside the cyclic region is the least
+    representative traversal (often a single looping trip) and removing it
+    best preserves the dominant linear pattern.
+
+    Detection uses Kahn's theorem: peeling in-degree-0 nodes consumes the
+    whole graph iff it is acyclic. Nodes that never reach in-degree 0 are on
+    a cycle or downstream of one; trimming nodes without outgoing edges inside
+    that remainder shrinks it to the cyclic core, from which we delete the
+    (weight, u, v)-minimal edge. The lexicographic tie-break keeps output
+    deterministic across runs. Each pass removes one edge, so the loop
+    terminates after at most E passes (in practice one per anomaly).
+    """
+    removed_edges: list[tuple[str, str, int]] = []
+
+    while True:
+        # Plain counting pass of Kahn's algorithm to test acyclicity.
+        in_degree = {node: len(reverse_adjacency[node]) for node in adjacency}
+        queue = [node for node, degree in in_degree.items() if degree == 0]
+        processed_count = 0
+        while queue:
+            node = queue.pop()
+            processed_count += 1
+            for successor in adjacency[node]:
+                in_degree[successor] -= 1
+                if in_degree[successor] == 0:
+                    queue.append(successor)
+
+        if processed_count == len(adjacency):
+            return removed_edges
+
+        # Nodes never peeled lie on a cycle or strictly downstream of one.
+        remaining = {node for node, degree in in_degree.items() if degree > 0}
+
+        # Trim to the cyclic core: keep only nodes that still have an outgoing
+        # edge inside the remainder. The fixpoint contains every cycle, while
+        # chains that merely hang off a cycle are discarded so their edges are
+        # never sacrificed.
+        while True:
+            trimmed = {
+                node
+                for node in remaining
+                if any(successor in remaining for successor in adjacency[node])
+            }
+            if trimmed == remaining:
+                break
+            remaining = trimmed
+
+        weight, source, target = min(
+            (edge_weight, node, successor)
+            for node in remaining
+            for successor, edge_weight in adjacency[node].items()
+            if successor in remaining
+        )
+        del adjacency[source][target]
+        del reverse_adjacency[target][source]
+        removed_edges.append((source, target, weight))
+
+
+def compute_longest_downstream_paths(
+    adjacency: dict[str, dict[str, int]],
+) -> dict[str, int]:
+    """Longest path (in edges) from each node to any sink of the DAG.
+
+    Used as a tie-break metric: a node with a longer remaining path sits on
+    the route trunk rather than on a short branch. Longest path is NP-hard on
+    general graphs but linear on a DAG via dynamic programming over a
+    post-order traversal: longest(u) = 1 + max(longest(v) for v in succ(u)).
+
+    Must only be called after remove_cycle_edges — the memoized post-order
+    DFS assumes acyclicity. The DFS is iterative to avoid RecursionError on
+    very long stop chains.
+    """
+    longest_paths: dict[str, int] = {}
+
+    for start_node in adjacency:
+        if start_node in longest_paths:
+            continue
+
+        stack = [(start_node, iter(adjacency[start_node]))]
+        while stack:
+            node, successors = stack[-1]
+            descended = False
+            for successor in successors:
+                if successor not in longest_paths:
+                    stack.append((successor, iter(adjacency[successor])))
+                    descended = True
+                    break
+            if descended:
+                continue
+
+            # All successors resolved: apply the DP recurrence.
+            stack.pop()
+            longest_paths[node] = max(
+                (longest_paths[successor] + 1 for successor in adjacency[node]),
+                default=0,
+            )
+
+    return longest_paths
+
+
+def topological_superset_order(
+    adjacency: dict[str, dict[str, int]],
+    reverse_adjacency: dict[str, dict[str, int]],
+) -> list[str]:
+    """Flatten the DAG into one linear stop order via Kahn's algorithm.
+
+    Kahn's algorithm repeatedly emits a node with in-degree 0 and removes its
+    outgoing edges. When several nodes are ready simultaneously (a branch in
+    the route), the choice determines how branch stops interleave. We pick the
+    node minimizing:
+
+        (-incoming edge weight sum,  # busier approach == dominant pattern
+         -longest downstream path,   # trunk before short spurs
+         stop_id)                    # lexicographic => reproducible builds
+
+    Incoming weights are precomputed from the final reverse adjacency (not
+    decremented during the sort) so the metric is stable. The ready set is a
+    plain set scanned with min(); per-direction graphs hold tens to hundreds
+    of stops, so O(V^2) selection is simpler and fast enough compared to a
+    heap of composite keys.
+    """
+    incoming_weight = {
+        node: sum(reverse_adjacency[node].values()) for node in adjacency
+    }
+    longest_paths = compute_longest_downstream_paths(adjacency)
+    in_degree = {node: len(reverse_adjacency[node]) for node in adjacency}
+
+    ready = {node for node, degree in in_degree.items() if degree == 0}
+    ordered_stop_ids: list[str] = []
+
+    while ready:
+        node = min(
+            ready,
+            key=lambda candidate: (
+                -incoming_weight[candidate],
+                -longest_paths[candidate],
+                candidate,
+            ),
+        )
+        ready.remove(node)
+        ordered_stop_ids.append(node)
+
+        for successor in adjacency[node]:
+            in_degree[successor] -= 1
+            if in_degree[successor] == 0:
+                ready.add(successor)
+
+    if len(ordered_stop_ids) != len(adjacency):
+        raise ValueError(
+            "Topological sort left unvisited nodes; graph still contains a cycle"
+        )
+
+    return ordered_stop_ids
+
+
+def compute_progress_ratios(
+    ordered_stop_ids: list[str],
+    stop_coordinates: dict[str, tuple[float, float]],
+) -> tuple[float, list[float]]:
+    """Cumulative haversine progress of each superset stop along the line.
+
+    Returns (total_distance_meters, ratios) where ratios[i] is the cumulative
+    distance up to stop i divided by the total. Stops without coordinates
+    contribute a zero-length segment (the last known coordinate is carried
+    forward). If no distance can be computed at all, ratios fall back to
+    uniform spacing. The endpoints are forced to exactly 0.0 and 1.0 so
+    clients can rely on closed-interval bounds despite float accumulation.
+    """
+    if len(ordered_stop_ids) < 2:
+        raise ValueError("Progress ratios require at least two stops")
+
+    cumulative_distances = [0.0]
+    total_distance = 0.0
+    last_known_coordinate = stop_coordinates.get(ordered_stop_ids[0])
+
+    for stop_id in ordered_stop_ids[1:]:
+        coordinate = stop_coordinates.get(stop_id)
+        if last_known_coordinate is not None and coordinate is not None:
+            total_distance += haversine_distance_meters(
+                last_known_coordinate[0],
+                last_known_coordinate[1],
+                coordinate[0],
+                coordinate[1],
+            )
+        if coordinate is not None:
+            last_known_coordinate = coordinate
+        cumulative_distances.append(total_distance)
+
+    if total_distance > 0.0:
+        ratios = [distance / total_distance for distance in cumulative_distances]
+    else:
+        segment_count = len(ordered_stop_ids) - 1
+        ratios = [index / segment_count for index in range(len(ordered_stop_ids))]
+
+    ratios[0] = 0.0
+    ratios[-1] = 1.0
+    return total_distance, ratios
+
+
+def select_direction_label(trips: list[tuple[str, str, list[str]]]) -> str:
+    """Pick the direction label from the most frequent non-empty headsign.
+
+    Ties are resolved in favor of the headsign carried by the longest trip
+    (most stops), then lexicographically for deterministic output. Returns an
+    empty string when no trip has a headsign so clients can fall back.
+    """
+    headsign_counts = Counter(headsign for _, headsign, _ in trips if headsign)
+    if not headsign_counts:
+        return ""
+
+    max_count = max(headsign_counts.values())
+    tied_headsigns = {
+        headsign for headsign, count in headsign_counts.items() if count == max_count
+    }
+    if len(tied_headsigns) == 1:
+        return next(iter(tied_headsigns))
+
+    longest_trip_length: dict[str, int] = {}
+    for _, headsign, stop_ids in trips:
+        if headsign in tied_headsigns:
+            longest_trip_length[headsign] = max(
+                longest_trip_length.get(headsign, 0), len(stop_ids)
+            )
+
+    return min(
+        tied_headsigns,
+        key=lambda headsign: (-longest_trip_length[headsign], headsign),
+    )
+
+
+def fetch_stop_coordinates(
+    connection: sqlite3.Connection,
+) -> dict[str, tuple[float, float]]:
+    """Load stop_id -> (lat, lon) once; stops without coordinates are omitted."""
+    if not table_exists(connection, "stops"):
+        return {}
+
+    stop_columns = list_table_columns(connection, "stops")
+    if not {"stop_id", "stop_lat", "stop_lon"}.issubset(stop_columns):
+        return {}
+
+    stop_coordinates: dict[str, tuple[float, float]] = {}
+    for stop_id, stop_lat, stop_lon in connection.execute(
+        f"SELECT {quote_identifier('stop_id')}, {quote_identifier('stop_lat')}, "
+        f"{quote_identifier('stop_lon')} FROM {quote_identifier('stops')}"
+    ):
+        if stop_id is None or stop_lat is None or stop_lon is None:
+            continue
+        stop_coordinates[str(stop_id)] = (float(stop_lat), float(stop_lon))
+
+    return stop_coordinates
+
+
+def iter_direction_group_trips(
+    connection: sqlite3.Connection,
+) -> Iterator[tuple[tuple[str, int], list[tuple[str, str, list[str]]]]]:
+    """Stream trips grouped by (route_id, direction_id).
+
+    Yields ((route_id, direction_id), trips) where each trip is
+    (trip_id, headsign, ordered_stop_ids). A single ORDER BY query guarantees
+    group contiguity, so only one group is materialized at a time and the
+    total cost stays O(|stop_times|) regardless of trip count. Missing
+    direction_id/trip_headsign columns (agency schema variance) degrade to
+    constant selects.
+    """
+    trip_columns = list_table_columns(connection, "trips")
+    direction_sql = (
+        f"COALESCE(t.{quote_identifier('direction_id')}, 0)"
+        if "direction_id" in trip_columns
+        else "0"
+    )
+    headsign_sql = (
+        f"COALESCE(t.{quote_identifier('trip_headsign')}, '')"
+        if "trip_headsign" in trip_columns
+        else "''"
+    )
+
+    query = (
+        f"SELECT t.{quote_identifier('route_id')}, {direction_sql} AS direction_value, "
+        f"t.{quote_identifier('trip_id')}, {headsign_sql}, st.{quote_identifier('stop_id')} "
+        f"FROM {quote_identifier('trips')} AS t "
+        f"JOIN {quote_identifier('stop_times')} AS st "
+        f"ON st.{quote_identifier('trip_id')} = t.{quote_identifier('trip_id')} "
+        f"WHERE t.{quote_identifier('route_id')} IS NOT NULL "
+        f"AND st.{quote_identifier('stop_id')} IS NOT NULL "
+        f"ORDER BY t.{quote_identifier('route_id')}, direction_value, "
+        f"t.{quote_identifier('trip_id')}, st.{quote_identifier('stop_sequence')}"
+    )
+
+    current_key: tuple[str, int] | None = None
+    current_trips: list[tuple[str, str, list[str]]] = []
+    current_trip_id: str | None = None
+
+    cursor = connection.execute(query)
+    for route_id, direction_id, trip_id, headsign, stop_id in cursor:
+        group_key = (str(route_id), int(direction_id))
+        trip_id = str(trip_id)
+
+        if group_key != current_key:
+            if current_key is not None and current_trips:
+                yield current_key, current_trips
+            current_key = group_key
+            current_trips = []
+            current_trip_id = None
+
+        if trip_id != current_trip_id:
+            current_trips.append((trip_id, str(headsign or ""), []))
+            current_trip_id = trip_id
+
+        current_trips[-1][2].append(str(stop_id))
+
+    if current_key is not None and current_trips:
+        yield current_key, current_trips
+
+
+def build_canonical_route_records(
+    route_id: str,
+    direction_id: int,
+    trips: list[tuple[str, str, list[str]]],
+    stop_coordinates: dict[str, tuple[float, float]],
+) -> tuple[tuple, list[tuple]] | None:
+    """Run the full superset pipeline for one (route_id, direction_id) group.
+
+    Returns the canonical_routes row and the canonical_route_stops rows, or
+    None when the group cannot form a meaningful linear superset (< 2 stops).
+    Superset nodes are unique by construction, so the composite primary key
+    (route_id, direction_id, stop_id) can never collide.
+    """
+    adjacency, reverse_adjacency = build_stop_graph(
+        [stop_ids for _, _, stop_ids in trips]
+    )
+
+    # Single-stop trips contribute nodes without edges; an isolated node has
+    # no defined position on a line, so it is dropped.
+    isolated_nodes = [
+        node
+        for node in adjacency
+        if not adjacency[node] and not reverse_adjacency[node]
+    ]
+    for node in isolated_nodes:
+        del adjacency[node]
+        del reverse_adjacency[node]
+
+    if len(adjacency) < 2:
+        LOGGER.warning(
+            "Skipping canonical route %s direction %d: fewer than 2 connected stops",
+            route_id,
+            direction_id,
+        )
+        return None
+
+    for source, target, weight in remove_cycle_edges(adjacency, reverse_adjacency):
+        LOGGER.info(
+            "Removed cycle edge for route %s direction %d: %s -> %s (weight %d)",
+            route_id,
+            direction_id,
+            source,
+            target,
+            weight,
+        )
+
+    superset_stop_ids = topological_superset_order(adjacency, reverse_adjacency)
+    total_distance, progress_ratios = compute_progress_ratios(
+        superset_stop_ids, stop_coordinates
+    )
+    direction_label = select_direction_label(trips)
+
+    route_row = (
+        route_id,
+        direction_id,
+        direction_label,
+        superset_stop_ids[0],
+        superset_stop_ids[-1],
+        total_distance,
+    )
+    stop_rows = [
+        (route_id, direction_id, stop_id, sequence, ratio)
+        for sequence, (stop_id, ratio) in enumerate(
+            zip(superset_stop_ids, progress_ratios)
+        )
+    ]
+    return route_row, stop_rows
+
+
+def create_canonical_route_tables(connection: sqlite3.Connection) -> None:
+    """(Re)create the canonical route tables; caller owns the transaction."""
+    connection.execute("DROP TABLE IF EXISTS canonical_route_stops")
+    connection.execute("DROP TABLE IF EXISTS canonical_routes")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS canonical_routes (
+            route_id TEXT,
+            direction_id INTEGER,
+            direction_label TEXT,
+            start_stop_id TEXT,
+            end_stop_id TEXT,
+            total_distance REAL,
+            PRIMARY KEY (route_id, direction_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS canonical_route_stops (
+            route_id TEXT,
+            direction_id INTEGER,
+            stop_id TEXT,
+            superset_sequence INTEGER,
+            progress_ratio REAL,
+            PRIMARY KEY (route_id, direction_id, stop_id),
+            FOREIGN KEY (route_id, direction_id) REFERENCES canonical_routes(route_id, direction_id)
+        )
+        """
+    )
+
+
+def build_canonical_routes(connection: sqlite3.Connection) -> None:
+    """Generate canonical_routes and canonical_route_stops from imported GTFS."""
+    for required_table in ("trips", "stop_times", "stops"):
+        if not table_exists(connection, required_table):
+            LOGGER.warning(
+                "Skipping canonical routes because %s table is missing",
+                required_table,
+            )
+            return
+
+    trip_columns = list_table_columns(connection, "trips")
+    if not {"trip_id", "route_id"}.issubset(trip_columns):
+        LOGGER.warning(
+            "Skipping canonical routes because trips table lacks required columns"
+        )
+        return
+
+    stop_time_columns = list_table_columns(connection, "stop_times")
+    if not {"trip_id", "stop_id", "stop_sequence"}.issubset(stop_time_columns):
+        LOGGER.warning(
+            "Skipping canonical routes because stop_times table lacks required columns"
+        )
+        return
+
+    stop_coordinates = fetch_stop_coordinates(connection)
+
+    created_routes = 0
+    inserted_stop_rows = 0
+    skipped_groups = 0
+
+    with connection:
+        create_canonical_route_tables(connection)
+
+        for (route_id, direction_id), trips in iter_direction_group_trips(connection):
+            records = build_canonical_route_records(
+                route_id, direction_id, trips, stop_coordinates
+            )
+            if records is None:
+                skipped_groups += 1
+                continue
+
+            route_row, stop_rows = records
+            connection.execute(
+                "INSERT INTO canonical_routes (route_id, direction_id, "
+                "direction_label, start_stop_id, end_stop_id, total_distance) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                route_row,
+            )
+            for chunk_start in range(0, len(stop_rows), IMPORT_CHUNK_SIZE):
+                connection.executemany(
+                    "INSERT INTO canonical_route_stops (route_id, direction_id, "
+                    "stop_id, superset_sequence, progress_ratio) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    stop_rows[chunk_start : chunk_start + IMPORT_CHUNK_SIZE],
+                )
+            created_routes += 1
+            inserted_stop_rows += len(stop_rows)
+
+        for index_columns in (
+            ("route_id", "direction_id", "superset_sequence"),
+            ("stop_id",),
+        ):
+            index_name = build_index_name("canonical_route_stops", index_columns)
+            quoted_columns = ", ".join(
+                quote_identifier(column_name) for column_name in index_columns
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                f"{quote_identifier(index_name)} ON "
+                f"{quote_identifier('canonical_route_stops')} ({quoted_columns})"
+            )
+
+    LOGGER.info(
+        "Created %d canonical routes with %d superset stops (%d groups skipped)",
+        created_routes,
+        inserted_stop_rows,
+        skipped_groups,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1246,6 +1824,13 @@ def main() -> int:
         create_recommended_indexes(connection, gtfs_files)
     except (OSError, ValueError, sqlite3.Error) as error:
         LOGGER.error("Failed to create recommended indexes: %s", error)
+        connection.close()
+        return 1
+
+    try:
+        build_canonical_routes(connection)
+    except (ValueError, sqlite3.Error) as error:
+        LOGGER.error("Failed to build canonical routes: %s", error)
         connection.close()
         return 1
 

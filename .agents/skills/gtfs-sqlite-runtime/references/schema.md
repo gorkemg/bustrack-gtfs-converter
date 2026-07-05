@@ -63,7 +63,7 @@ All values are physically stored as `TEXT`, but their semantic meaning differs:
 | `feed_start_date` | Effective service period start | GTFS date string `YYYYMMDD` | `20260501` |
 | `feed_end_date` | Effective service period end | GTFS date string `YYYYMMDD` | `20261231` |
 | `gtfs_source_filename` | Local extracted folder name used as source | String | `pvta` |
-| `schema_version` | App-facing schema contract version | String | `1.0` |
+| `schema_version` | App-facing schema contract version | String | `1.1` |
 
 Notes:
 
@@ -95,6 +95,49 @@ PVTA matching priority:
 3. GTFS `routes.route_id` -> provider `RouteAbbreviation`
 
 If no PVTA match is found, `route_rt_id` falls back to `route_id`.
+
+### `canonical_routes` and `canonical_route_stops` (schema_version >= 1.1)
+
+The converter derives one canonical, maximum-extent stop ordering per `(route_id, direction_id)` by merging all trip variants (including short-turn trips) into a directed graph and flattening it with a topological sort (the "topological superset"). This gives linear UI components (e.g. Live Activity progress bars) a single stable stop axis per direction.
+
+```sql
+CREATE TABLE canonical_routes (
+  route_id TEXT,
+  direction_id INTEGER,
+  direction_label TEXT,
+  start_stop_id TEXT,
+  end_stop_id TEXT,
+  total_distance REAL,
+  PRIMARY KEY (route_id, direction_id)
+);
+
+CREATE TABLE canonical_route_stops (
+  route_id TEXT,
+  direction_id INTEGER,
+  stop_id TEXT,
+  superset_sequence INTEGER,
+  progress_ratio REAL,
+  PRIMARY KEY (route_id, direction_id, stop_id),
+  FOREIGN KEY (route_id, direction_id) REFERENCES canonical_routes(route_id, direction_id)
+);
+```
+
+Semantics:
+
+- `route_id` is the GTFS route ID (join to `routes.route_id`; map to `route_rt_id` via `routes` when talking to realtime APIs).
+- `direction_id` is the GTFS direction; feeds without a `direction_id` column collapse to `0`.
+- `direction_label` is the most frequent non-empty `trip_headsign` of the direction group (ties resolved by the longest trip, then lexicographically); empty string when no headsign exists.
+- `superset_sequence` starts at `0` and orders stops along the canonical line.
+- `progress_ratio` is the cumulative haversine distance up to the stop divided by `total_distance` (meters); the first stop is exactly `0.0`, the last exactly `1.0`. When no coordinates are usable, ratios fall back to uniform spacing and `total_distance` is `0.0`.
+- Each stop appears at most once per `(route_id, direction_id)`; cycles in the merged graph (loop routes, feed anomalies) are broken by removing the lowest-frequency edge, so ring services are approximated linearly.
+- Groups that cannot form a line (fewer than 2 connected stops) are skipped.
+- The `FOREIGN KEY` clause is declarative only; SQLite does not enforce it without `PRAGMA foreign_keys`.
+- Both tables are dropped and recreated on every conversion run.
+
+Indexes:
+
+- `canonical_route_stops (route_id, direction_id, superset_sequence)` — ordered read path for one direction
+- `canonical_route_stops (stop_id)` — reverse lookup from a stop to its canonical positions
 
 ## Why agency artifacts differ
 
