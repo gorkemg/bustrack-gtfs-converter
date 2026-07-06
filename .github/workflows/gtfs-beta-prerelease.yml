@@ -14,9 +14,11 @@ on:
     branches:
       - beta
 
-concurrency:
-  group: gtfs-sync-release-${{ github.ref }}
-  cancel-in-progress: false
+# No concurrency block here on purpose: the called workflow's own
+# workflow-level concurrency (gtfs-sync-release-${{ github.ref }}) also
+# applies to workflow_call runs. Declaring the same group in both files makes
+# the caller hold the group while the called workflow waits for it — GitHub
+# detects that as a deadlock and cancels the run.
 
 jobs:
   beta:
