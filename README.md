@@ -24,8 +24,18 @@ To ensure zero-downtime and high reliability for mobile end-users, this reposito
 | **Production** | `{agency}` | Stable | Primary endpoint for production mobile applications. |
 | **Previous** | `{agency}-previous` | Backup | Immediate rollback point in case of data inconsistencies. |
 | **Archive** | `{agency}-YYYYMMDD-HHMM` | Historical | Immutable record for audit trails and regression testing. |
+| **Beta** | `{agency}-prerelease` | Testing | Rolling pre-release built from the `beta` branch for app-side testing. |
 
 The repository does not rely on GitHub's global `Latest` badge. Clients are expected to fetch explicit agency tags such as `pvta` or `uta`.
+
+### Beta Channel
+
+Every push to the `beta` branch triggers the sync workflow in beta mode (see `.github/workflows/gtfs-beta-prerelease.yml`):
+
+- The converter always runs with `--force-update`, so an artifact is produced even when the upstream GTFS feed is unchanged — the point is to test converter changes, not feed changes.
+- The result is published as a GitHub pre-release under the rolling tag `{agency}-prerelease`, with the asset name `{agency}.sqlite.zip` replaced on each run.
+- Production tags (`{agency}`, `{agency}-previous`, archive tags) are never created or modified by beta runs, so production clients remain unaffected.
+- Scheduled runs and `config/agencies.json` pushes on `main` continue to publish through the production tiers only.
 
 ### Sync Cadence and Release Timing
 

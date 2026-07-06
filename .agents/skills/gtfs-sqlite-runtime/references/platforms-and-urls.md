@@ -21,12 +21,14 @@ Tag strategy:
 - production: `{agency}`
 - rollback backup: `{agency}-previous`
 - archive snapshot: `{agency}-YYYYMMDD-HHMM`
+- beta testing: `{agency}-prerelease` (rolling pre-release built from every push to the `beta` branch; never consumed by production clients)
 
 Examples:
 
 - `pvta`
 - `pvta-previous`
 - `pvta-20260503-1430`
+- `pvta-prerelease`
 
 Expected asset names from the converter:
 

@@ -1,0 +1,26 @@
+name: GTFS Beta Prerelease
+
+# Any push to the beta branch builds fresh SQLite artifacts and publishes
+# them as {agency}-prerelease pre-releases. Production tags ({agency},
+# {agency}-previous, {agency}-YYYYMMDD-HHMM) are never touched by beta runs;
+# the channel is derived from the branch name inside the called workflow.
+#
+# This lives in a separate trigger file because a single `on.push` cannot
+# combine branch-specific path filters: main only reacts to
+# config/agencies.json changes, while beta must react to every push.
+
+on:
+  push:
+    branches:
+      - beta
+
+concurrency:
+  group: gtfs-sync-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  beta:
+    uses: ./.github/workflows/gtfs-sync-release.yml
+    permissions:
+      contents: write
+    secrets: inherit

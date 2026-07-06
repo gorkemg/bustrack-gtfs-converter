@@ -2,6 +2,8 @@ name: GTFS Sync & Release
 
 on:
   push:
+    branches:
+      - main
     paths:
       - config/agencies.json
   schedule:
@@ -12,6 +14,7 @@ on:
         description: 'Force update even if no new GTFS data is detected'
         type: boolean
         default: false
+  workflow_call:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -69,6 +72,10 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+    env:
+      # Runs on the beta branch publish only {agency}-prerelease; every other
+      # ref publishes the production tag trio.
+      RELEASE_CHANNEL: ${{ github.ref_name == 'beta' && 'beta' || 'production' }}
     strategy:
       fail-fast: false
       matrix:
@@ -115,6 +122,11 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force_update }}" = "true" ]; then
             FORCE_UPDATE_ARGS="--force-update"
           fi
+          # Beta builds exist to test converter changes, so they must produce
+          # an artifact even when the upstream GTFS feed is unchanged.
+          if [ "$RELEASE_CHANNEL" = "beta" ]; then
+            FORCE_UPDATE_ARGS="--force-update"
+          fi
           python scripts/convert.py --agency ${{ matrix.agency }} --cleanup-extracted $FORCE_UPDATE_ARGS 2>&1 | tee logs/${{ matrix.agency }}.log
 
       - name: Check if SQLite archive was created
@@ -145,9 +157,20 @@ jobs:
             echo "created=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Write Fallback Beta Release Notes
+        # Forced beta builds skip the upstream release comparison, so the
+        # converter does not emit release notes on its own.
+        if: env.RELEASE_CHANNEL == 'beta' && steps.check_file.outputs.created == 'true' && steps.check_release_notes.outputs.created != 'true'
+        run: |
+          {
+            echo "Beta prerelease for ${{ matrix.agency }} built from branch ${{ github.ref_name }}."
+            echo "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "Commit: ${{ github.sha }}"
+          } > "data/${{ matrix.agency }}.release-notes.md"
+
       - name: Capture Current Production Asset
         id: previous_asset
-        if: steps.check_file.outputs.created == 'true'
+        if: env.RELEASE_CHANNEL == 'production' && steps.check_file.outputs.created == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -167,7 +190,7 @@ jobs:
           fi
 
       - name: Create Archive Release
-        if: steps.check_file.outputs.created == 'true'
+        if: env.RELEASE_CHANNEL == 'production' && steps.check_file.outputs.created == 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ matrix.agency }}-${{ steps.timestamp.outputs.value }}
@@ -198,7 +221,7 @@ jobs:
           generate_release_notes: false
 
       - name: Create or Update Production Release
-        if: steps.check_file.outputs.created == 'true'
+        if: env.RELEASE_CHANNEL == 'production' && steps.check_file.outputs.created == 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ matrix.agency }}
@@ -211,11 +234,25 @@ jobs:
           append_body: false
           generate_release_notes: false
 
+      - name: Create or Update Beta Prerelease
+        if: env.RELEASE_CHANNEL == 'beta' && steps.check_file.outputs.created == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ matrix.agency }}-prerelease
+          name: ${{ matrix.agency }} Prerelease ${{ steps.timestamp.outputs.value }}
+          files: data/${{ matrix.agency }}.sqlite.zip
+          body_path: data/${{ matrix.agency }}.release-notes.md
+          draft: false
+          prerelease: true
+          make_latest: false
+          append_body: false
+          generate_release_notes: false
+
       - name: Report Agency Result
         if: always()
         run: |
           if [ "${{ steps.check_file.outputs.created }}" = "true" ]; then
-            echo "Agency ${{ matrix.agency }} finished successfully and produced a release artifact." >> "$GITHUB_STEP_SUMMARY"
+            echo "Agency ${{ matrix.agency }} finished successfully and produced a ${{ env.RELEASE_CHANNEL }} release artifact." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "Agency ${{ matrix.agency }} did not produce a release artifact. Check converter-log-${{ matrix.agency }} for details." >> "$GITHUB_STEP_SUMMARY"
           fi

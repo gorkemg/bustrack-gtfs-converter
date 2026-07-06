@@ -65,7 +65,7 @@ sqlite3 data/pvta.sqlite "SELECT name, sql FROM sqlite_master WHERE type IN ('ta
 - Do not describe `app_metadata` or `route_rt_id` as part of upstream GTFS. They are repository-specific additions.
 - Do not assume every generated DB came from the same agency; verify `app_metadata.agency_id`.
 - Do not coerce GTFS time strings into naive local datetimes.
-- Do not assume release discovery via "latest". Use explicit tags such as `pvta`, `pvta-previous`, or `pvta-YYYYMMDD-HHMM`.
+- Do not assume release discovery via "latest". Use explicit tags such as `pvta`, `pvta-previous`, or `pvta-YYYYMMDD-HHMM`. The `pvta-prerelease` tag is a beta-channel artifact built from the `beta` branch and must not be given to production clients.
 - Do not assume the database enforces relational integrity for you.
 - Do not assume all agencies expose the same table set, column set, or `route_rt_id` behavior.
 - Do not tell other agents to poll exactly at the cron timestamp without allowing for GitHub scheduler lag.
