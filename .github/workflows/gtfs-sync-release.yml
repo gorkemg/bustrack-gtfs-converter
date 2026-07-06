@@ -190,6 +190,10 @@ jobs:
           fi
 
       - name: Create Archive Release
+        # Archives are kept as draft releases: drafts never create git tags,
+        # so the tags page stays limited to {agency}, {agency}-previous, and
+        # {agency}-prerelease while the historical assets remain retrievable
+        # by maintainers via the releases page or the API.
         if: env.RELEASE_CHANNEL == 'production' && steps.check_file.outputs.created == 'true'
         uses: softprops/action-gh-release@v3
         with:
@@ -197,7 +201,7 @@ jobs:
           name: ${{ matrix.agency }} Archive ${{ steps.timestamp.outputs.value }}
           files: data/${{ matrix.agency }}.sqlite.zip
           body_path: data/${{ matrix.agency }}.release-notes.md
-          draft: false
+          draft: true
           prerelease: false
           make_latest: false
           append_body: false

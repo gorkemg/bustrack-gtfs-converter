@@ -19,11 +19,11 @@ The repository keeps feed processing out of the production app stack. Conversion
 
 To ensure zero-downtime and high reliability for mobile end-users, this repository employs a triple-tier release model.
 
-| Tier | Tag Format | Scope | Purpose |
+| Tier | Tag / Format | Scope | Purpose |
 | :--- | :--- | :--- | :--- |
 | **Production** | `{agency}` | Stable | Primary endpoint for production mobile applications. |
 | **Previous** | `{agency}-previous` | Backup | Immediate rollback point in case of data inconsistencies. |
-| **Archive** | `{agency}-YYYYMMDD-HHMM` | Historical | Immutable record for audit trails and regression testing. |
+| **Archive** | Draft release `{agency} Archive YYYYMMDD-HHMM` (untagged) | Historical | Immutable record for audit trails and regression testing. Stored as maintainer-only draft releases so archive runs do not clutter the tags page. |
 | **Beta** | `{agency}-prerelease` | Testing | Rolling pre-release built from the `beta` branch for app-side testing. |
 
 The repository does not rely on GitHub's global `Latest` badge. Clients are expected to fetch explicit agency tags such as `pvta` or `uta`.
