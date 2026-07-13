@@ -156,6 +156,7 @@ The pipeline currently validates:
 - successful GTFS file discovery
 - row counts between CSV input and SQLite output
 - non-empty `stops`, `trips`, and `stop_times` tables
+- presence of the derived `canonical_routes` (non-empty) and `canonical_stop_counterparts` tables; an empty counterpart table is allowed because loop-only feeds legitimately produce no counterparts
 - release provenance fields in `app_metadata`
 
 ## Repository Layout

@@ -433,14 +433,55 @@ class ConvertTests(unittest.TestCase):
                     "CREATE TABLE stop_times (trip_id TEXT, arrival_time TEXT, stop_id TEXT)"
                 )
                 connection.execute("INSERT INTO stop_times VALUES ('10', '08:00:00', '1')")
+                convert.create_canonical_route_tables(connection)
+                convert.create_canonical_stop_counterpart_table(connection)
+                connection.execute(
+                    "INSERT INTO canonical_routes VALUES ('R1', 0, 'Label', '1', '2', 100.0)"
+                )
                 connection.commit()
             finally:
                 connection.close()
 
             validated_tables, total_rows = convert.validate_database(sqlite_path, csv_dir)
 
+            # Derived tables are sanity-checked but not counted; an empty
+            # counterpart table is legitimate (loop-only feeds).
             self.assertEqual(validated_tables, 3)
             self.assertEqual(total_rows, 3)
+
+    def test_validate_database_raises_when_canonical_routes_missing_or_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            csv_dir = Path(temp_dir) / "csv"
+            csv_dir.mkdir()
+            (csv_dir / "stops.txt").write_text(
+                "stop_id,stop_name\n1,Stop A\n",
+                encoding="utf-8",
+            )
+
+            sqlite_path = Path(temp_dir) / "test.sqlite"
+            connection = sqlite3.connect(sqlite_path)
+            try:
+                connection.execute("CREATE TABLE stops (stop_id TEXT, stop_name TEXT)")
+                connection.execute("INSERT INTO stops VALUES ('1', 'Stop A')")
+                connection.commit()
+            finally:
+                connection.close()
+
+            # Missing canonical tables must fail validation.
+            with self.assertRaises(SystemExit):
+                convert.validate_database(sqlite_path, csv_dir)
+
+            connection = sqlite3.connect(sqlite_path)
+            try:
+                convert.create_canonical_route_tables(connection)
+                convert.create_canonical_stop_counterpart_table(connection)
+                connection.commit()
+            finally:
+                connection.close()
+
+            # Present but empty canonical_routes must fail as well.
+            with self.assertRaises(SystemExit):
+                convert.validate_database(sqlite_path, csv_dir)
 
     def test_validate_database_raises_on_row_count_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -595,7 +636,7 @@ class ConvertTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (csv_dir / "stops.txt").write_text(
-                "stop_id,stop_name,stop_lat,stop_lon\n1,Stop A,1.0,2.0\n",
+                "stop_id,stop_name,stop_lat,stop_lon\n1,Stop A,1.0,2.0\n2,Stop B,1.1,2.0\n",
                 encoding="utf-8",
             )
             (csv_dir / "trips.txt").write_text(
@@ -603,7 +644,7 @@ class ConvertTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (csv_dir / "stop_times.txt").write_text(
-                "trip_id,arrival_time,stop_id,stop_sequence\nT1,08:00:00,1,1\n",
+                "trip_id,arrival_time,stop_id,stop_sequence\nT1,08:00:00,1,1\nT1,08:05:00,2,2\n",
                 encoding="utf-8",
             )
             output_path = temp_root / "pvta.sqlite"
@@ -659,7 +700,7 @@ class ConvertTests(unittest.TestCase):
             def fake_download(url: str, target_dir: Path) -> None:
                 target_dir.mkdir(parents=True, exist_ok=True)
                 (target_dir / "stops.txt").write_text(
-                    "stop_id,stop_name,stop_lat,stop_lon\n1,Stop A,1.0,2.0\n",
+                    "stop_id,stop_name,stop_lat,stop_lon\n1,Stop A,1.0,2.0\n2,Stop B,1.1,2.0\n",
                     encoding="utf-8",
                 )
                 (target_dir / "trips.txt").write_text(
@@ -667,7 +708,7 @@ class ConvertTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 (target_dir / "stop_times.txt").write_text(
-                    "trip_id,arrival_time,stop_id,stop_sequence\nT1,08:00:00,1,1\n",
+                    "trip_id,arrival_time,stop_id,stop_sequence\nT1,08:00:00,1,1\nT1,08:05:00,2,2\n",
                     encoding="utf-8",
                 )
 
@@ -710,7 +751,7 @@ class ConvertTests(unittest.TestCase):
             def fake_download(url: str, target_dir: Path) -> None:
                 target_dir.mkdir(parents=True, exist_ok=True)
                 (target_dir / "stops.txt").write_text(
-                    "stop_id,stop_name,stop_lat,stop_lon\n1,Stop A,1.0,2.0\n",
+                    "stop_id,stop_name,stop_lat,stop_lon\n1,Stop A,1.0,2.0\n2,Stop B,1.1,2.0\n",
                     encoding="utf-8",
                 )
                 (target_dir / "trips.txt").write_text(
@@ -718,7 +759,7 @@ class ConvertTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 (target_dir / "stop_times.txt").write_text(
-                    "trip_id,arrival_time,stop_id,stop_sequence\nT1,08:00:00,1,1\n",
+                    "trip_id,arrival_time,stop_id,stop_sequence\nT1,08:00:00,1,1\nT1,08:05:00,2,2\n",
                     encoding="utf-8",
                 )
 

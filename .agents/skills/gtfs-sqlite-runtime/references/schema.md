@@ -233,6 +233,8 @@ After building the DB, the converter validates:
 
 - row counts per GTFS file match CSV-to-SQLite
 - `stops`, `trips`, and `stop_times` are not empty
+- `canonical_routes` exists and is not empty
+- `canonical_stop_counterparts` exists (may be empty for loop-only feeds)
 - `app_metadata` exists and is populated by the build flow
 
 ## Good inspection queries

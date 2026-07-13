@@ -508,6 +508,22 @@ def validate_database(sqlite_path: Path, csv_folder: Path) -> tuple[int, int]:
 
             validated_tables += 1
             total_rows += table_row_count
+
+        # Derived tables have no CSV counterpart, so the row-count loop above
+        # never sees them. Apps depend on the canonical line structures, so
+        # canonical_routes must be populated for any real feed. The
+        # counterpart table only has to exist: a feed consisting solely of
+        # one-directional loop routes legitimately yields zero counterparts.
+        for derived_table in ("canonical_routes", "canonical_stop_counterparts"):
+            if not table_exists(connection, derived_table):
+                LOGGER.error(
+                    "Sanity check failed: %s table is missing", derived_table
+                )
+                raise SystemExit(1)
+
+        if count_table_rows(connection, "canonical_routes") == 0:
+            LOGGER.error("Sanity check failed: canonical_routes contains 0 rows")
+            raise SystemExit(1)
     finally:
         connection.close()
 
