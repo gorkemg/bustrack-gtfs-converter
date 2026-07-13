@@ -23,6 +23,8 @@ from urllib.request import Request, urlopen
 LOGGER = logging.getLogger("gtfs_converter")
 IMPORT_CHUNK_SIZE = 5000
 EARTH_RADIUS_METERS = 6371000.0
+COUNTERPART_MAX_DISTANCE_METERS = 150.0
+COUNTERPART_MAX_MIRROR_ERROR = 0.15
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -957,7 +959,7 @@ def create_app_metadata(
     connection: sqlite3.Connection,
     input_path: Path,
     agency_id: str,
-    schema_version: str = "1.1",
+    schema_version: str = "1.2",
 ) -> None:
     feed_start_date, feed_end_date = extract_feed_date_range(input_path)
     metadata_rows = [
@@ -1634,6 +1636,252 @@ def build_canonical_routes(connection: sqlite3.Connection) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Canonical stop counterparts (opposite-direction stop pairing)
+#
+# GTFS has no standard link between a stop and its opposite-direction twin
+# across the street. We derive that link per (route_id, direction_id) from
+# the canonical supersets: the counterpart of a stop is a stop of the same
+# route in the opposite direction group, geometrically close, and at a
+# mirrored position along the line. Loop routes without an opposite group
+# correctly yield no counterpart.
+# ---------------------------------------------------------------------------
+
+
+def fetch_stop_parent_stations(connection: sqlite3.Connection) -> dict[str, str]:
+    """Load stop_id -> parent_station for stops with a non-empty parent.
+
+    parent_station is the official GTFS mechanism for grouping related stops
+    (location_type 1 stations). Feeds rarely maintain it exhaustively, but
+    where present it is authoritative, so it outranks geometric matching.
+    """
+    if not table_exists(connection, "stops"):
+        return {}
+
+    stop_columns = list_table_columns(connection, "stops")
+    if not {"stop_id", "parent_station"}.issubset(stop_columns):
+        return {}
+
+    parent_stations: dict[str, str] = {}
+    for stop_id, parent_station in connection.execute(
+        f"SELECT {quote_identifier('stop_id')}, {quote_identifier('parent_station')} "
+        f"FROM {quote_identifier('stops')} "
+        f"WHERE {quote_identifier('parent_station')} IS NOT NULL "
+        f"AND {quote_identifier('parent_station')} != ''"
+    ):
+        if stop_id is not None:
+            parent_stations[str(stop_id)] = str(parent_station)
+
+    return parent_stations
+
+
+def fetch_canonical_direction_groups(
+    connection: sqlite3.Connection,
+) -> dict[tuple[str, int], dict[str, float]]:
+    """Load canonical_route_stops as (route_id, direction_id) -> {stop_id: ratio}."""
+    groups: dict[tuple[str, int], dict[str, float]] = {}
+    for route_id, direction_id, stop_id, progress_ratio in connection.execute(
+        "SELECT route_id, direction_id, stop_id, progress_ratio "
+        "FROM canonical_route_stops"
+    ):
+        groups.setdefault((str(route_id), int(direction_id)), {})[str(stop_id)] = (
+            float(progress_ratio)
+        )
+    return groups
+
+
+def match_stop_counterparts(
+    forward_ratios: dict[str, float],
+    backward_ratios: dict[str, float],
+    stop_coordinates: dict[str, tuple[float, float]],
+    parent_stations: dict[str, str],
+) -> list[tuple[str, str, float | None, str]]:
+    """Pair each forward-direction stop with its opposite-direction twin.
+
+    Returns (stop_id, counterpart_stop_id, distance_meters, match_type) rows.
+    Matching priority per stop:
+
+      1. 'same_stop'       - the stop itself serves both directions.
+      2. 'parent_station'  - a candidate shares the stop's GTFS parent_station
+                             (authoritative grouping; no distance or mirror
+                             constraint applied).
+      3. 'paired'          - geometric match: candidates within
+                             COUNTERPART_MAX_DISTANCE_METERS whose mirrored
+                             progress |p - (1 - p_candidate)| stays below
+                             COUNTERPART_MAX_MIRROR_ERROR; the nearest wins.
+
+    The mirror check is a filter, not a ranking: superset ratios of the two
+    directions are not exactly symmetric (short-turns, branch interleaving),
+    so ranking by mirror error picks wrong stops. Its job is only to reject
+    candidates from another passage of the same route through the area.
+    Distance decides among the survivors; stop_id breaks remaining ties for
+    reproducible builds. Stops without any admissible candidate produce no
+    row - the app then correctly offers no direction switch.
+    """
+    matches: list[tuple[str, str, float | None, str]] = []
+
+    for stop_id in sorted(forward_ratios):
+        if stop_id in backward_ratios:
+            matches.append((stop_id, stop_id, 0.0, "same_stop"))
+            continue
+
+        stop_coordinate = stop_coordinates.get(stop_id)
+
+        def candidate_distance(candidate_id: str) -> float | None:
+            candidate_coordinate = stop_coordinates.get(candidate_id)
+            if stop_coordinate is None or candidate_coordinate is None:
+                return None
+            return haversine_distance_meters(
+                stop_coordinate[0],
+                stop_coordinate[1],
+                candidate_coordinate[0],
+                candidate_coordinate[1],
+            )
+
+        parent_station = parent_stations.get(stop_id, "")
+        if parent_station:
+            parent_candidates = sorted(
+                candidate_id
+                for candidate_id in backward_ratios
+                if parent_stations.get(candidate_id, "") == parent_station
+            )
+            if parent_candidates:
+                best_candidate = min(
+                    parent_candidates,
+                    key=lambda candidate_id: (
+                        candidate_distance(candidate_id)
+                        if candidate_distance(candidate_id) is not None
+                        else float("inf"),
+                        candidate_id,
+                    ),
+                )
+                matches.append(
+                    (
+                        stop_id,
+                        best_candidate,
+                        candidate_distance(best_candidate),
+                        "parent_station",
+                    )
+                )
+                continue
+
+        stop_ratio = forward_ratios[stop_id]
+        geometric_candidates: list[tuple[float, str]] = []
+        for candidate_id, candidate_ratio in backward_ratios.items():
+            distance = candidate_distance(candidate_id)
+            if distance is None or distance > COUNTERPART_MAX_DISTANCE_METERS:
+                continue
+            mirror_error = abs(stop_ratio - (1.0 - candidate_ratio))
+            if mirror_error > COUNTERPART_MAX_MIRROR_ERROR:
+                continue
+            geometric_candidates.append((distance, candidate_id))
+
+        if geometric_candidates:
+            distance, candidate_id = min(geometric_candidates)
+            matches.append((stop_id, candidate_id, distance, "paired"))
+
+    return matches
+
+
+def create_canonical_stop_counterpart_table(connection: sqlite3.Connection) -> None:
+    """(Re)create the counterpart table; caller owns the transaction."""
+    connection.execute("DROP TABLE IF EXISTS canonical_stop_counterparts")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS canonical_stop_counterparts (
+            route_id TEXT,
+            direction_id INTEGER,
+            stop_id TEXT,
+            counterpart_stop_id TEXT,
+            counterpart_direction_id INTEGER,
+            counterpart_distance REAL,
+            match_type TEXT,
+            PRIMARY KEY (route_id, direction_id, stop_id),
+            FOREIGN KEY (route_id, direction_id) REFERENCES canonical_routes(route_id, direction_id)
+        )
+        """
+    )
+
+
+def build_canonical_stop_counterparts(connection: sqlite3.Connection) -> None:
+    """Generate canonical_stop_counterparts from the canonical route tables."""
+    for required_table in ("canonical_routes", "canonical_route_stops"):
+        if not table_exists(connection, required_table):
+            LOGGER.warning(
+                "Skipping stop counterparts because %s table is missing",
+                required_table,
+            )
+            return
+
+    direction_groups = fetch_canonical_direction_groups(connection)
+    stop_coordinates = fetch_stop_coordinates(connection)
+    parent_stations = fetch_stop_parent_stations(connection)
+
+    inserted_rows = 0
+    match_type_counts: dict[str, int] = {}
+    groups_without_opposite = 0
+
+    with connection:
+        create_canonical_stop_counterpart_table(connection)
+
+        for route_id, direction_id in sorted(direction_groups):
+            # GTFS constrains direction_id to 0 or 1, so the opposite group
+            # is always the complement.
+            opposite_key = (route_id, 1 - direction_id)
+            if opposite_key not in direction_groups:
+                groups_without_opposite += 1
+                continue
+
+            matches = match_stop_counterparts(
+                direction_groups[(route_id, direction_id)],
+                direction_groups[opposite_key],
+                stop_coordinates,
+                parent_stations,
+            )
+            rows = [
+                (
+                    route_id,
+                    direction_id,
+                    stop_id,
+                    counterpart_stop_id,
+                    1 - direction_id,
+                    distance,
+                    match_type,
+                )
+                for stop_id, counterpart_stop_id, distance, match_type in matches
+            ]
+            for chunk_start in range(0, len(rows), IMPORT_CHUNK_SIZE):
+                connection.executemany(
+                    "INSERT INTO canonical_stop_counterparts (route_id, "
+                    "direction_id, stop_id, counterpart_stop_id, "
+                    "counterpart_direction_id, counterpart_distance, match_type) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    rows[chunk_start : chunk_start + IMPORT_CHUNK_SIZE],
+                )
+            inserted_rows += len(rows)
+            for _, _, _, match_type in matches:
+                match_type_counts[match_type] = match_type_counts.get(match_type, 0) + 1
+
+        index_name = build_index_name("canonical_stop_counterparts", ("stop_id",))
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS "
+            f"{quote_identifier(index_name)} ON "
+            f"{quote_identifier('canonical_stop_counterparts')} "
+            f"({quote_identifier('stop_id')})"
+        )
+
+    LOGGER.info(
+        "Created %d stop counterparts (%s; %d one-directional groups skipped)",
+        inserted_rows,
+        ", ".join(
+            f"{match_type}: {count}"
+            for match_type, count in sorted(match_type_counts.items())
+        )
+        or "none",
+        groups_without_opposite,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert a GTFS directory into an optimized SQLite database."
@@ -1831,6 +2079,13 @@ def main() -> int:
         build_canonical_routes(connection)
     except (ValueError, sqlite3.Error) as error:
         LOGGER.error("Failed to build canonical routes: %s", error)
+        connection.close()
+        return 1
+
+    try:
+        build_canonical_stop_counterparts(connection)
+    except (ValueError, sqlite3.Error) as error:
+        LOGGER.error("Failed to build stop counterparts: %s", error)
         connection.close()
         return 1
 

@@ -63,7 +63,7 @@ All values are physically stored as `TEXT`, but their semantic meaning differs:
 | `feed_start_date` | Effective service period start | GTFS date string `YYYYMMDD` | `20260501` |
 | `feed_end_date` | Effective service period end | GTFS date string `YYYYMMDD` | `20261231` |
 | `gtfs_source_filename` | Local extracted folder name used as source | String | `pvta` |
-| `schema_version` | App-facing schema contract version | String | `1.1` |
+| `schema_version` | App-facing schema contract version | String | `1.2` |
 
 Notes:
 
@@ -138,6 +138,49 @@ Indexes:
 
 - `canonical_route_stops (route_id, direction_id, superset_sequence)` — ordered read path for one direction
 - `canonical_route_stops (stop_id)` — reverse lookup from a stop to its canonical positions
+
+### `canonical_stop_counterparts` (schema_version >= 1.2)
+
+GTFS has no standard link between a stop and its opposite-direction twin across the street. The converter derives that link per `(route_id, direction_id)` from the canonical tables so apps can offer a "switch direction" affordance on a stop page.
+
+```sql
+CREATE TABLE canonical_stop_counterparts (
+  route_id TEXT,
+  direction_id INTEGER,
+  stop_id TEXT,
+  counterpart_stop_id TEXT,
+  counterpart_direction_id INTEGER,
+  counterpart_distance REAL,
+  match_type TEXT,
+  PRIMARY KEY (route_id, direction_id, stop_id),
+  FOREIGN KEY (route_id, direction_id) REFERENCES canonical_routes(route_id, direction_id)
+);
+```
+
+Semantics:
+
+- One row per stop of a canonical direction group whose route also has an opposite direction group. Loop routes and one-directional groups produce no rows — the absence of a row means "no direction switch possible here" and is intentional.
+- `counterpart_stop_id` is a stop of the **same route** in the **opposite direction** (`counterpart_direction_id = 1 - direction_id`).
+- `counterpart_distance` is the haversine distance in meters (`0.0` for `same_stop`; `NULL` when coordinates are missing).
+- `match_type` explains the pairing provenance:
+  - `same_stop` — the stop itself serves both directions (terminals, hubs); no street crossing needed.
+  - `parent_station` — both stops share a GTFS `parent_station` (authoritative; no distance/mirror constraint).
+  - `paired` — geometric match: nearest opposite-direction stop within 150 m whose mirrored linear position (`|p - (1 - p_counterpart)| <= 0.15`) confirms it lies on the corresponding section of the line.
+- Pairings are computed independently per direction, so rows are not guaranteed to be perfectly symmetric.
+- For a human-readable direction hint, join the counterpart to `canonical_routes` and display its `direction_label`:
+
+```sql
+SELECT c.counterpart_stop_id, s.stop_name, r.direction_label, c.match_type
+FROM canonical_stop_counterparts c
+JOIN canonical_routes r
+  ON r.route_id = c.route_id AND r.direction_id = c.counterpart_direction_id
+JOIN stops s ON s.stop_id = c.counterpart_stop_id
+WHERE c.stop_id = ?;
+```
+
+Index:
+
+- `canonical_stop_counterparts (stop_id)` — lookup of all counterpart rows for a stop page
 
 ## Why agency artifacts differ
 

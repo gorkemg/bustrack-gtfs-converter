@@ -71,7 +71,7 @@ Every generated SQLite database contains an `app_metadata` table. This serves as
 | :--- | :--- |
 | `agency_id` | Unique identifier (e.g., `pvta`, `uta`) to prevent cross-agency data loading. |
 | `build_timestamp` | ISO-8601 timestamp of the conversion process. |
-| `schema_version` | Internal versioning of the database structure. Current version: `1.1` (adds the canonical route tables). |
+| `schema_version` | Internal versioning of the database structure. Current version: `1.2` (adds canonical route tables and opposite-direction stop counterparts). |
 | `git_commit_sha` | The exact version of the conversion logic used. |
 | `workflow_run_id` | Reference to the GitHub Action run for full traceability. |
 | `feed_start_date` | Commencement date of the GTFS schedule validity. |
@@ -84,6 +84,8 @@ Every generated SQLite database contains an `app_metadata` table. This serves as
 ## Canonical Routes (Topological Superset)
 
 Since `schema_version` `1.1`, every database additionally contains two derived tables: `canonical_routes` and `canonical_route_stops`. For each `(route_id, direction_id)` pair, the converter merges all trip variants — including short-turn trips — into a weighted directed graph and flattens it via topological sort into a single maximum-extent stop ordering. Each stop carries a `progress_ratio` (`0.0` at the first stop, `1.0` at the last, based on cumulative haversine distance), which lets linear UI components such as Live Activities position a vehicle on one stable axis per direction. Cycles caused by loop routes or feed anomalies are broken deterministically by removing the lowest-frequency edge. Full column semantics are documented in `.agents/skills/gtfs-sqlite-runtime/references/schema.md`.
+
+Since `schema_version` `1.2`, the derived table `canonical_stop_counterparts` additionally links each stop to its opposite-direction twin per route ("the stop across the street"). Matching prefers GTFS `parent_station` grouping where present, otherwise pairs the nearest opposite-direction stop within 150 m whose mirrored `progress_ratio` confirms the corresponding line section. Loop routes yield no counterpart rows by design.
 
 ---
 

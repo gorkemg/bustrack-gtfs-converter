@@ -575,11 +575,15 @@ class ConvertTests(unittest.TestCase):
                 schema_version = connection.execute(
                     "SELECT value FROM app_metadata WHERE key = 'schema_version'"
                 ).fetchone()[0]
+                counterpart_table_exists = convert.table_exists(
+                    connection, "canonical_stop_counterparts"
+                )
             finally:
                 connection.close()
 
             self.assertEqual(canonical_route_count, 1)
-            self.assertEqual(schema_version, "1.1")
+            self.assertEqual(schema_version, "1.2")
+            self.assertTrue(counterpart_table_exists)
 
     def test_main_uses_agency_for_local_folder_without_remote_update_check(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1001,6 +1005,149 @@ class ConvertTests(unittest.TestCase):
                 "SELECT route_id, direction_id FROM canonical_routes"
             ).fetchall()
             self.assertEqual(route_rows, [("R1", 0)])
+        finally:
+            connection.close()
+
+    def test_match_stop_counterparts_returns_same_stop_and_nearest_pair(self) -> None:
+        # B serves both directions; A1/A2 are a street pair ~44m apart.
+        matches = convert.match_stop_counterparts(
+            {"A1": 0.0, "B": 0.5},
+            {"A2": 1.0, "B": 0.5},
+            {"A1": (0.0, 0.0), "A2": (0.0004, 0.0), "B": (0.0, 0.001)},
+            {},
+        )
+
+        self.assertEqual(len(matches), 2)
+        by_stop = {match[0]: match for match in matches}
+        self.assertEqual(by_stop["B"], ("B", "B", 0.0, "same_stop"))
+        stop_id, counterpart_id, distance, match_type = by_stop["A1"]
+        self.assertEqual(counterpart_id, "A2")
+        self.assertEqual(match_type, "paired")
+        self.assertAlmostEqual(distance, 44.5, delta=2.0)
+
+    def test_match_stop_counterparts_mirror_filter_rejects_wrong_passage(self) -> None:
+        # N is nearest but sits at the same linear position (another passage
+        # of the route through the area); F mirrors the progress correctly.
+        matches = convert.match_stop_counterparts(
+            {"S": 0.1},
+            {"N": 0.1, "F": 0.88},
+            {"S": (0.0, 0.0), "N": (0.00027, 0.0), "F": (0.0007, 0.0)},
+            {},
+        )
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0][1], "F")
+        self.assertEqual(matches[0][3], "paired")
+
+    def test_match_stop_counterparts_prefers_shared_parent_station(self) -> None:
+        # H is nearer and mirror-perfect, but G shares the GTFS parent_station.
+        matches = convert.match_stop_counterparts(
+            {"S": 0.0},
+            {"G": 0.2, "H": 1.0},
+            {"S": (0.0, 0.0), "G": (0.0006, 0.0), "H": (0.0002, 0.0)},
+            {"S": "P1", "G": "P1"},
+        )
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0][1], "G")
+        self.assertEqual(matches[0][3], "parent_station")
+
+    def test_match_stop_counterparts_returns_no_match_outside_radius(self) -> None:
+        matches = convert.match_stop_counterparts(
+            {"S": 0.0},
+            {"T": 1.0},
+            {"S": (0.0, 0.0), "T": (0.002, 0.0)},
+            {},
+        )
+
+        self.assertEqual(matches, [])
+
+    def test_build_canonical_stop_counterparts_populates_table(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.execute(
+                "CREATE TABLE trips (route_id TEXT, service_id TEXT, trip_id TEXT, "
+                "trip_headsign TEXT, direction_id INTEGER)"
+            )
+            connection.execute(
+                "CREATE TABLE stop_times (trip_id TEXT, arrival_time TEXT, "
+                "stop_id TEXT, stop_sequence INTEGER)"
+            )
+            connection.execute(
+                "CREATE TABLE stops (stop_id TEXT, stop_name TEXT, "
+                "stop_lat REAL, stop_lon REAL)"
+            )
+            connection.executemany(
+                "INSERT INTO stops VALUES (?, ?, ?, ?)",
+                [
+                    ("A1", "Stop A east", 0.0, 0.0),
+                    ("B1", "Stop B east", 0.0, 0.001),
+                    ("C1", "Stop C east", 0.0, 0.002),
+                    ("A2", "Stop A west", 0.0004, 0.0),
+                    ("B2", "Stop B west", 0.0004, 0.001),
+                    ("C2", "Stop C west", 0.0004, 0.002),
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO trips VALUES (?, ?, ?, ?, ?)",
+                [
+                    ("R1", "S1", "T1", "Eastbound", 0),
+                    ("R1", "S1", "T2", "Westbound", 1),
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO stop_times VALUES (?, ?, ?, ?)",
+                [
+                    ("T1", "08:00:00", "A1", 1),
+                    ("T1", "08:05:00", "B1", 2),
+                    ("T1", "08:10:00", "C1", 3),
+                    ("T2", "09:00:00", "C2", 1),
+                    ("T2", "09:05:00", "B2", 2),
+                    ("T2", "09:10:00", "A2", 3),
+                ],
+            )
+
+            convert.build_canonical_routes(connection)
+            convert.build_canonical_stop_counterparts(connection)
+
+            rows = connection.execute(
+                "SELECT route_id, direction_id, stop_id, counterpart_stop_id, "
+                "counterpart_direction_id, match_type "
+                "FROM canonical_stop_counterparts ORDER BY direction_id, stop_id"
+            ).fetchall()
+            self.assertEqual(len(rows), 6)
+            self.assertIn(("R1", 0, "A1", "A2", 1, "paired"), rows)
+            self.assertIn(("R1", 0, "B1", "B2", 1, "paired"), rows)
+            self.assertIn(("R1", 1, "C2", "C1", 0, "paired"), rows)
+
+            distances = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT counterpart_distance FROM canonical_stop_counterparts"
+                ).fetchall()
+            ]
+            for distance in distances:
+                self.assertAlmostEqual(distance, 44.5, delta=2.0)
+
+            index_names = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                ).fetchall()
+            }
+            self.assertIn("idx_canonical_stop_counterparts_stop_id", index_names)
+        finally:
+            connection.close()
+
+    def test_build_canonical_stop_counterparts_skips_without_canonical_tables(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            with self.assertLogs("gtfs_converter", level="WARNING"):
+                convert.build_canonical_stop_counterparts(connection)
+
+            self.assertFalse(
+                convert.table_exists(connection, "canonical_stop_counterparts")
+            )
         finally:
             connection.close()
 
