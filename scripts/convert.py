@@ -1096,6 +1096,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force download and conversion even if no newer GTFS source metadata is detected.",
     )
+    parser.add_argument("--status-file", type=Path, help="Write the successful conversion result to this file.")
     return parser.parse_args()
 
 
@@ -1109,6 +1110,8 @@ def configure_logging(log_level: str) -> None:
 def main() -> int:
     args = parse_args()
     configure_logging(args.log_level)
+    if args.status_file:
+        args.status_file.unlink(missing_ok=True)
 
     try:
         agencies_config = load_agencies_config(get_agencies_config_path())
@@ -1176,6 +1179,8 @@ def main() -> int:
                 )
                 if not should_update:
                     LOGGER.info("No update needed; skipping download, conversion, and release creation.")
+                    if args.status_file:
+                        args.status_file.write_text("unchanged\n", encoding="utf-8")
                     return 0
                 should_download = True
 
@@ -1272,13 +1277,13 @@ def main() -> int:
         LOGGER.error("Failed to create SQLite archive: %s", error)
         return 1
 
-    if args.agency and upstream_metadata is not None:
+    if args.agency:
         release_notes_path = output_path.with_suffix(".release-notes.md")
         try:
             write_release_notes(
                 release_notes_path,
                 args.agency,
-                upstream_metadata,
+                upstream_metadata or {},
                 validated_tables,
                 total_rows,
             )
@@ -1303,6 +1308,8 @@ def main() -> int:
         validated_tables,
         total_rows,
     )
+    if args.status_file:
+        args.status_file.write_text("generated\n", encoding="utf-8")
     return 0
 
 
