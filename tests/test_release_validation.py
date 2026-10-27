@@ -1,4 +1,5 @@
 import sqlite3
+from io import BytesIO
 import stat
 import tempfile
 import unittest
@@ -7,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts import convert
-from scripts.validate_release import validate_release
+from scripts.validate_release import copy_bounded, validate_release
 
 
 class ReleaseValidationTests(unittest.TestCase):
@@ -27,6 +28,18 @@ class ReleaseValidationTests(unittest.TestCase):
     def make_archive(self, name='pvta.sqlite', content=None):
         with zipfile.ZipFile(self.archive, 'w', zipfile.ZIP_DEFLATED) as archive:
             archive.writestr(name, self.database.read_bytes() if content is None else content)
+
+    def test_bounded_copy_rejects_excess_and_short_data(self):
+        for data, expected in [(b'1234', 3), (b'12', 3)]:
+            with self.subTest(data=data):
+                with self.assertRaises(ValueError):
+                    copy_bounded(BytesIO(data), BytesIO(), expected)
+        with patch('scripts.validate_release.MAX_DATABASE_SIZE', 3):
+            with self.assertRaises(ValueError):
+                copy_bounded(BytesIO(b'1234'), BytesIO(), 4)
+        destination = BytesIO()
+        copy_bounded(BytesIO(b'123'), destination, 3)
+        self.assertEqual(destination.getvalue(), b'123')
 
     def test_valid_archive(self):
         self.make_archive()

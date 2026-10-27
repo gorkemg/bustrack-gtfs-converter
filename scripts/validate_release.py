@@ -1,6 +1,5 @@
 """Validate the generated release asset before any release is modified."""
 import argparse
-import shutil
 import sqlite3
 import stat
 import tempfile
@@ -8,6 +7,20 @@ import zipfile
 from pathlib import Path
 
 MAX_DATABASE_SIZE = 2 * 1024 * 1024 * 1024
+
+
+def copy_bounded(source, destination, expected_size: int) -> None:
+    copied = 0
+    while True:
+        chunk = source.read(min(65536, MAX_DATABASE_SIZE - copied + 1))
+        if not chunk:
+            break
+        copied += len(chunk)
+        if copied > MAX_DATABASE_SIZE or copied > expected_size:
+            raise ValueError("Decompressed database exceeds its size limit")
+        destination.write(chunk)
+    if copied != expected_size:
+        raise ValueError("Decompressed database size does not match archive metadata")
 
 
 def validate_release(archive_path: Path, agency: str) -> None:
@@ -28,7 +41,7 @@ def validate_release(archive_path: Path, agency: str) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "release.sqlite"
             with archive.open(entry) as source, database.open("wb") as dest:
-                shutil.copyfileobj(source, dest)
+                copy_bounded(source, dest, entry.file_size)
             with sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True) as connection:
                 if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
                     raise ValueError("SQLite integrity check failed")

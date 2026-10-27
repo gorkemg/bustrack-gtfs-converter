@@ -18,6 +18,13 @@ jobs:
       contents: write
 
     steps:
+      - name: Require main branch
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Rollback may only run from main" >&2
+            exit 1
+          fi
+
       - name: Checkout Repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:

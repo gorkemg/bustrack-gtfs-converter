@@ -5,6 +5,14 @@ updates:
     schedule:
       interval: daily
     groups:
-      github-actions:
+      github-actions-security:
+        applies-to: security-updates
         patterns:
           - '*'
+      github-actions-routine:
+        applies-to: version-updates
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
