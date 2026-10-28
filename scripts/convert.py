@@ -275,6 +275,9 @@ def build_http_request(url: str, method: str = "GET", github_api: bool = False) 
         "User-Agent": USER_AGENT,
     }
     if github_api:
+        parts = urlsplit(url)
+        if parts.hostname != "api.github.com" or (parts.port or 443) != 443:
+            raise ValueError("GitHub API requests must target api.github.com")
         headers["Accept"] = "application/vnd.github+json"
 
     github_token = os.environ.get("GITHUB_TOKEN")
@@ -532,6 +535,8 @@ def download_and_extract_zip(url: str, target_dir: Path) -> None:
                 expanded = 0
                 for entry in entries:
                     name = entry.filename
+                    if entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                        raise ValueError("Unsupported ZIP compression method")
                     path = PurePosixPath(name)
                     mode = entry.external_attr >> 16
                     if (not name or "\\" in name or name.startswith("/") or
@@ -839,6 +844,13 @@ def parse_pvta_route_details_records(xml_payload: bytes) -> list[dict[str, str]]
     if len(xml_payload) > MAX_XML_BYTES:
         raise ValueError("Route details payload exceeds size limit")
     text = xml_payload.decode("utf-8-sig")
+    if "\x00" in text:
+        raise ValueError("Route details must use UTF-8 without NUL bytes")
+    declaration = re.match(r"\s*<\?xml\s+[^?]*\?>", text, flags=re.IGNORECASE)
+    if declaration:
+        encoding = re.search(r"\bencoding\s*=\s*(['\"])(.*?)\1", declaration.group(), flags=re.IGNORECASE)
+        if encoding and encoding.group(2).lower() != "utf-8":
+            raise ValueError("Route details XML must declare UTF-8")
     if re.search(r"<!\s*(?:DOCTYPE|ENTITY)\b", text, flags=re.IGNORECASE):
         raise ValueError("XML DTD and entity declarations are forbidden")
     try:

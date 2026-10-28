@@ -54,11 +54,25 @@ class IngestionSecurityTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         convert.download_and_extract_zip('https://example.test/feed', Path(temp) / 'feed')
 
+    def test_rejects_unsupported_compression(self):
+        for method in (zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as temp:
+                payload = io.BytesIO()
+                with zipfile.ZipFile(payload, 'w', compression=method) as archive:
+                    archive.writestr('stops.txt', 'data')
+                payload.seek(0)
+                with patch.object(convert, 'secure_open', return_value=payload), self.assertRaises(ValueError):
+                    convert.download_and_extract_zip('https://example.test/feed', Path(temp) / 'feed')
+
     def test_https_only_redirect_and_token_scope(self):
         with self.assertRaises(ValueError):
             convert.build_http_request('http://example.test/feed')
         with patch.dict('os.environ', {'GITHUB_TOKEN': 'test-token'}):
             self.assertFalse(convert.build_http_request('https://example.test/feed').has_header('Authorization'))
+            self.assertTrue(convert.build_http_request('https://api.github.com/repos/a/b', github_api=True).has_header('Authorization'))
+            for url in ('https://evil.test/', 'https://api.github.com.evil.test/', 'https://api.github.com:444/'):
+                with self.assertRaises(ValueError):
+                    convert.build_http_request(url, github_api=True)
         def redirect(url):
             return HTTPError('https://api.github.com/resource', 302, 'redirect', {'Location': url}, None)
         for location, token in [('http://evil.test/', False), ('https://evil.test/', True)]:
@@ -83,6 +97,11 @@ class IngestionSecurityTests(unittest.TestCase):
         evil = b'<!DOCTYPE x [<!ENTITY e "bad">]><x>&e;</x>'
         with self.assertRaises(ValueError):
             convert.parse_pvta_route_details_records(evil)
+        for encoding in ('utf-16', 'utf-32', 'utf-16-le', 'utf-16-be', 'utf-32-le', 'utf-32-be'):
+            with self.subTest(encoding=encoding), self.assertRaises((ValueError, UnicodeError)):
+                convert.parse_pvta_route_details_records(evil.decode().encode(encoding))
+        with self.assertRaises(ValueError):
+            convert.parse_pvta_route_details_records(b'<?xml version="1.0" encoding="ISO-8859-1"?><x/>')
         with tempfile.TemporaryDirectory() as temp:
             cache = Path(temp) / 'cache.xml'
             cache.write_bytes(evil)
