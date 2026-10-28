@@ -1,0 +1,9 @@
+# Beta security maintenance
+
+This branch retains the canonical GTFS schema 1.2: canonical_routes, canonical_route_stops and canonical_stop_counterparts. Its release validator checks the single bounded SQLite ZIP entry, integrity, agency/schema/build metadata, nonempty GTFS tables, canonical stop ordering/progress and counterpart references. Empty counterparts remain valid for one-direction or loop-only feeds. This does not establish upstream authenticity, completeness or freshness.
+
+The read-only security-check job tests pull requests. Scheduled workflows run from the default branch; a schedule declaration on beta alone does not establish daily beta coverage. Dependabot version updates target the default branch; security fixes for beta require deliberate backports.
+
+Input retrieval, staged archive extraction and the fresh HTTPS route-details cache use the reviewed main security controls, retaining the beta canonical algorithms. HTTPS, bounded redirects and bytes, Stored/Deflate-only entries and UTF-8 XML declaration checks reject malformed input. Network budgets are cooperative, not hard interruptible DNS/header deadlines; job timeouts remain the outer bound. Invalid new route details use a validated cache, or the existing route-ID fallback if no valid cache exists.
+
+Any push to beta builds fresh artifacts through the reusable workflow and publishes only agency-prerelease tags. Only exact main and beta refs can enter its write-enabled sync job; arbitrary refs cannot publish production. Explicit generated/unchanged status and independent schema-1.2 archive validation must succeed before release writes. Rollback is restricted to main. Per-ref concurrency prevents overlap but is neither a FIFO queue nor a transaction. Multi-step release uploads are not atomic. Never dispatch publication workflows merely to test a change; local conversions and PR tests do not modify releases.
