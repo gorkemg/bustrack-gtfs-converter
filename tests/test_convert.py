@@ -189,7 +189,7 @@ class ConvertTests(unittest.TestCase):
 
         self.assertEqual(
             cache_path,
-            convert.get_repo_root() / "internal" / "assets" / "cache" / "pvta_routedetails.xml",
+            convert.get_repo_root() / "internal" / "assets" / "cache" / "pvta_routedetails_https_v2.json",
         )
 
     def test_enrich_route_realtime_ids_defaults_to_route_id_and_indexes_column(self) -> None:
@@ -239,7 +239,7 @@ class ConvertTests(unittest.TestCase):
                     [("B43", "B43"), ("R2", "2")],
                 )
 
-                with patch("scripts.convert.urlopen", return_value=BytesIO(xml_payload)):
+                with patch("scripts.convert.secure_open", return_value=BytesIO(xml_payload)):
                     convert.enrich_route_realtime_ids(connection, "pvta", cache_path)
 
                 rows = connection.execute(
@@ -271,7 +271,7 @@ class ConvertTests(unittest.TestCase):
                     [(" b43 ", "unused"), ("801", "T1"), ("LOCAL801", " 8 0 1 "), ("T1", "misc")],
                 )
 
-                with patch("scripts.convert.urlopen", return_value=BytesIO(xml_payload)):
+                with patch("scripts.convert.secure_open", return_value=BytesIO(xml_payload)):
                     convert.enrich_route_realtime_ids(connection, "pvta", cache_path)
 
                 rows = connection.execute(
@@ -328,7 +328,7 @@ class ConvertTests(unittest.TestCase):
             cache_path = Path(temp_dir) / "pvta_routedetails.xml"
             cache_path.write_bytes(xml_payload)
 
-            with patch("scripts.convert.urlopen", side_effect=URLError("offline")):
+            with patch("scripts.convert.secure_open", side_effect=URLError("offline")):
                 loaded_payload = convert.load_pvta_route_details_xml(cache_path)
 
         self.assertEqual(loaded_payload, xml_payload)
@@ -348,7 +348,7 @@ class ConvertTests(unittest.TestCase):
         )
 
         with patch.dict("os.environ", {"GITHUB_REPOSITORY": "example/repo"}, clear=False):
-            with patch("scripts.convert.urlopen", side_effect=not_found_error):
+            with patch("scripts.convert.secure_open", side_effect=not_found_error):
                 release_metadata = convert.fetch_release_source_metadata_from_github("uta")
 
         self.assertIsNone(release_metadata)
@@ -362,7 +362,7 @@ class ConvertTests(unittest.TestCase):
 
             archive_bytes.seek(0)
 
-            with patch("scripts.convert.urlopen", return_value=archive_bytes):
+            with patch("scripts.convert.secure_open", return_value=archive_bytes):
                 convert.download_and_extract_zip("https://example.test/feed.zip", target_dir)
 
             self.assertTrue((target_dir / "stops.txt").exists())
@@ -377,7 +377,7 @@ class ConvertTests(unittest.TestCase):
 
             archive_bytes.seek(0)
 
-            with patch("scripts.convert.urlopen", return_value=archive_bytes):
+            with patch("scripts.convert.secure_open", return_value=archive_bytes):
                 convert.download_and_extract_zip("https://example.test/feed.zip", target_dir)
 
             self.assertTrue((target_dir / "stops.txt").exists())
@@ -666,7 +666,7 @@ class ConvertTests(unittest.TestCase):
                         "scripts.convert.get_pvta_route_details_cache_path",
                         return_value=temp_root / "cache" / "pvta_routedetails.xml",
                     ):
-                        with patch("scripts.convert.urlopen", return_value=BytesIO(xml_payload)):
+                        with patch("scripts.convert.secure_open", return_value=BytesIO(xml_payload)):
                             with patch(
                                 "sys.argv",
                                 [

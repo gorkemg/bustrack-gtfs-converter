@@ -84,9 +84,9 @@ Meaning:
 - `route_rt_id` is the app/realtime-facing route identifier.
 - For most agencies, it defaults to `route_id`.
 - For `pvta`, the converter tries to map GTFS routes to provider realtime route IDs using the PVTA route details feed at:
-  - `http://bustracker.pvta.com/InfoPoint/rest/routedetails/getallroutedetails`
+  - `https://bustracker.pvta.com/InfoPoint/rest/routedetails/getallroutedetails`
 - That payload is cached locally at:
-  - `internal/assets/cache/pvta_routedetails.xml`
+  - `internal/assets/cache/pvta_routedetails_https_v2.json`
 
 PVTA matching priority:
 
