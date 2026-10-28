@@ -101,10 +101,10 @@ jobs:
         if: matrix.agency == 'pvta'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: internal/assets/cache/pvta_routedetails.xml
-          key: external-resource-cache-${{ matrix.agency }}-${{ env.EXTERNAL_CACHE_PERIOD }}
+          path: internal/assets/cache/pvta_routedetails_https_v2.json
+          key: external-resource-https-v2-${{ matrix.agency }}-${{ env.EXTERNAL_CACHE_PERIOD }}
           restore-keys: |
-            external-resource-cache-${{ matrix.agency }}-
+            external-resource-https-v2-${{ matrix.agency }}-
 
       - name: Prepare Timestamp
         id: timestamp
