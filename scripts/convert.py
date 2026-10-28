@@ -5,6 +5,10 @@ import csv
 import json
 import logging
 import os
+import re
+import stat
+import tempfile
+import time
 import shutil
 import sqlite3
 import uuid
@@ -12,10 +16,11 @@ import zipfile
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin, urlsplit
+from urllib.request import Request, HTTPRedirectHandler, build_opener
 
 
 LOGGER = logging.getLogger("gtfs_converter")
@@ -24,9 +29,18 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
-PVTA_ROUTE_DETAILS_URL = "http://bustracker.pvta.com/InfoPoint/rest/routedetails/getallroutedetails"
+PVTA_ROUTE_DETAILS_URL = "https://bustracker.pvta.com/InfoPoint/rest/routedetails/getallroutedetails"
+SOCKET_TIMEOUT = 15
+NETWORK_DEADLINE = 180
+MAX_REDIRECTS = 5
+MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
+MAX_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_MEMBER_BYTES = 1024 * 1024 * 1024
+MAX_ZIP_ENTRIES = 1000
+MAX_XML_BYTES = 5 * 1024 * 1024
+MAX_RELEASE_BYTES = 5 * 1024 * 1024
 CACHE_DIR_RELATIVE_PATH = Path("internal") / "assets" / "cache"
-PVTA_ROUTE_DETAILS_CACHE_RELATIVE_PATH = CACHE_DIR_RELATIVE_PATH / "pvta_routedetails.xml"
+PVTA_ROUTE_DETAILS_CACHE_RELATIVE_PATH = CACHE_DIR_RELATIVE_PATH / "pvta_routedetails_https_v2.json"
 
 INTEGER_COLUMN_NAMES = {
     "bikes_allowed",
@@ -180,7 +194,83 @@ def normalize_release_metadata_value(value: str | None) -> str:
     return value.strip()
 
 
+def validate_https_url(url: str) -> None:
+    if any(ord(c) < 32 or ord(c) == 127 for c in url):
+        raise ValueError("Invalid URL")
+    parts = urlsplit(url)
+    if parts.scheme.lower() != "https" or not parts.hostname or parts.username or parts.password:
+        raise ValueError("Only HTTPS URLs without embedded credentials are permitted")
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def secure_open(request: Request, deadline: float):
+    opener = build_opener(NoRedirect())
+    for redirects in range(MAX_REDIRECTS + 1):
+        validate_https_url(request.full_url)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Network time budget exhausted")
+        try:
+            return opener.open(request, timeout=min(SOCKET_TIMEOUT, remaining))
+        except HTTPError as error:
+            if error.code not in (301, 302, 303, 307, 308) or not error.headers.get("Location"):
+                raise
+            if redirects == MAX_REDIRECTS:
+                error.close()
+                raise ValueError("Too many redirects") from error
+            destination = urljoin(request.full_url, error.headers["Location"])
+            try:
+                validate_https_url(destination)
+            except ValueError:
+                error.close()
+                raise
+            old, new = urlsplit(request.full_url), urlsplit(destination)
+            if request.has_header("Authorization") and (old.hostname, old.port or 443) != (new.hostname, new.port or 443):
+                error.close()
+                raise ValueError("Refusing cross-origin authenticated redirect") from error
+            headers = dict(request.header_items())
+            method = request.get_method()
+            error.close()
+            request = Request(destination, headers=headers, method=method)
+    raise ValueError("Too many redirects")
+
+
+def read_network_chunk(source, size: int, deadline: float) -> bytes:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Network time budget exhausted")
+    # HTTPResponse exposes the socket through its buffered reader. Test streams
+    # have no socket and are still subject to the monotonic deadline check.
+    sock = getattr(getattr(getattr(source, "fp", None), "raw", None), "_sock", None)
+    if sock is not None:
+        sock.settimeout(min(SOCKET_TIMEOUT, remaining))
+    read = getattr(source, "read1", source.read)
+    chunk = read(size)
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Network time budget exhausted")
+    return chunk
+
+
+def read_bounded(source, limit: int, deadline: float) -> bytes:
+    chunks = []
+    total = 0
+    while True:
+        chunk = read_network_chunk(source, min(65536, limit - total + 1), deadline)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise ValueError("Download exceeds size limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def build_http_request(url: str, method: str = "GET", github_api: bool = False) -> Request:
+    validate_https_url(url)
     headers = {
         "User-Agent": USER_AGENT,
     }
@@ -196,7 +286,7 @@ def build_http_request(url: str, method: str = "GET", github_api: bool = False) 
 
 def fetch_last_modified(gtfs_url: str) -> datetime:
     request = build_http_request(gtfs_url, method="HEAD")
-    with urlopen(request, timeout=30) as response:
+    with secure_open(request, time.monotonic() + NETWORK_DEADLINE) as response:
         last_modified = response.headers.get("Last-Modified")
 
     if not last_modified:
@@ -207,7 +297,7 @@ def fetch_last_modified(gtfs_url: str) -> datetime:
 
 def fetch_source_metadata(gtfs_url: str) -> dict[str, str]:
     request = build_http_request(gtfs_url, method="HEAD")
-    with urlopen(request, timeout=30) as response:
+    with secure_open(request, time.monotonic() + NETWORK_DEADLINE) as response:
         last_modified = response.headers.get("Last-Modified")
         etag = response.headers.get("ETag")
 
@@ -251,8 +341,9 @@ def fetch_release_source_metadata_from_github(agency_id: str) -> dict[str, str] 
     request = build_http_request(release_url, github_api=True)
 
     try:
-        with urlopen(request, timeout=30) as response:
-            payload = json.load(response)
+        deadline = time.monotonic() + NETWORK_DEADLINE
+        with secure_open(request, deadline) as response:
+            payload = json.loads(read_bounded(response, MAX_RELEASE_BYTES, deadline))
     except HTTPError as error:
         if error.code == 404:
             return None
@@ -414,31 +505,88 @@ def flatten_extracted_gtfs_files(target_dir: Path) -> None:
 
 
 def download_and_extract_zip(url: str, target_dir: Path) -> None:
-    archive_path = target_dir.parent / f"{target_dir.name}.download.zip"
     request = build_http_request(url)
-
     target_dir.parent.mkdir(parents=True, exist_ok=True)
-    if target_dir.exists():
-        shutil.rmtree(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-
     try:
-        LOGGER.info("Downloading GTFS archive from %s", url)
-        with urlopen(request, timeout=120) as response, archive_path.open("wb") as handle:
-            shutil.copyfileobj(response, handle)
-
-        LOGGER.info("Extracting GTFS archive into %s", target_dir)
-        with zipfile.ZipFile(archive_path) as archive:
-            archive.extractall(target_dir)
-
-        flatten_extracted_gtfs_files(target_dir)
-    except (OSError, URLError, HTTPError, zipfile.BadZipFile) as error:
-        if target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
+        with tempfile.TemporaryDirectory(prefix=f".{target_dir.name}-", dir=target_dir.parent) as temp:
+            root = Path(temp)
+            archive_path = root / "feed.zip"
+            staged = root / "staged"
+            staged.mkdir()
+            deadline = time.monotonic() + NETWORK_DEADLINE
+            with secure_open(request, deadline) as response, archive_path.open("wb") as output:
+                total = 0
+                while True:
+                    chunk = read_network_chunk(response, min(65536, MAX_DOWNLOAD_BYTES - total + 1), deadline)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD_BYTES:
+                        raise ValueError("GTFS download exceeds size limit")
+                    output.write(chunk)
+            with zipfile.ZipFile(archive_path) as archive:
+                entries = archive.infolist()
+                if len(entries) > MAX_ZIP_ENTRIES:
+                    raise ValueError("Too many ZIP entries")
+                names, txt_names = set(), set()
+                expanded = 0
+                for entry in entries:
+                    name = entry.filename
+                    path = PurePosixPath(name)
+                    mode = entry.external_attr >> 16
+                    if (not name or "\\" in name or name.startswith("/") or
+                        any(part in (".", "..") for part in name.rstrip("/").split("/")) or
+                        re.match(r"^[A-Za-z]:", name) or
+                        stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR) or
+                        (stat.S_IFMT(mode) == stat.S_IFDIR) != entry.is_dir() and stat.S_IFMT(mode) != 0):
+                        raise ValueError("Unsafe ZIP entry")
+                    normalized = str(path)
+                    if normalized in names:
+                        raise ValueError("Duplicate ZIP entry")
+                    names.add(normalized)
+                    if not entry.is_dir() and path.suffix == ".txt":
+                        if path.name in txt_names:
+                            raise ValueError("Duplicate flattened GTFS file")
+                        txt_names.add(path.name)
+                    expanded += entry.file_size
+                    if entry.file_size > MAX_MEMBER_BYTES or expanded > MAX_EXPANDED_BYTES:
+                        raise ValueError("Expanded ZIP exceeds size limit")
+                if not txt_names:
+                    raise ValueError("ZIP contains no GTFS text files")
+                actual_total = 0
+                for entry in entries:
+                    destination = staged.joinpath(*PurePosixPath(entry.filename).parts)
+                    if entry.is_dir():
+                        destination.mkdir(parents=True, exist_ok=True)
+                        continue
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    actual_member = 0
+                    with archive.open(entry) as source, destination.open("xb") as output:
+                        while True:
+                            chunk = source.read(min(65536, MAX_MEMBER_BYTES - actual_member + 1))
+                            if not chunk:
+                                break
+                            actual_member += len(chunk)
+                            actual_total += len(chunk)
+                            if actual_member > entry.file_size or actual_member > MAX_MEMBER_BYTES or actual_total > MAX_EXPANDED_BYTES:
+                                raise ValueError("Expanded ZIP exceeds size limit")
+                            output.write(chunk)
+                    if actual_member != entry.file_size:
+                        raise ValueError("ZIP entry size mismatch")
+            flatten_extracted_gtfs_files(staged)
+            backup = root / "previous"
+            if target_dir.is_symlink():
+                raise ValueError("Input directory is a symlink")
+            if target_dir.exists():
+                target_dir.rename(backup)
+            try:
+                staged.rename(target_dir)
+            except BaseException:
+                if backup.exists():
+                    backup.rename(target_dir)
+                raise
+    except (OSError, URLError, zipfile.BadZipFile, ValueError) as error:
         raise ValueError(f"Failed to download or extract GTFS archive: {error}") from error
-    finally:
-        if archive_path.exists():
-            archive_path.unlink()
 
 
 def zip_sqlite_file(sqlite_path: Path) -> Path:
@@ -688,10 +836,15 @@ def normalize_route_match_key(value: str | None) -> str:
 
 
 def parse_pvta_route_details_records(xml_payload: bytes) -> list[dict[str, str]]:
+    if len(xml_payload) > MAX_XML_BYTES:
+        raise ValueError("Route details payload exceeds size limit")
+    text = xml_payload.decode("utf-8-sig")
+    if re.search(r"<!\s*(?:DOCTYPE|ENTITY)\b", text, flags=re.IGNORECASE):
+        raise ValueError("XML DTD and entity declarations are forbidden")
     try:
-        root = ElementTree.fromstring(xml_payload)
+        root = ElementTree.fromstring(text)
     except ElementTree.ParseError:
-        payload = json.loads(xml_payload.decode("utf-8-sig"))
+        payload = json.loads(text)
         if not isinstance(payload, list):
             raise
 
@@ -746,35 +899,45 @@ def parse_pvta_route_details_mapping(xml_payload: bytes) -> dict[str, str]:
     return mapping
 
 
+def validate_pvta_route_details(xml_payload: bytes) -> None:
+    records = parse_pvta_route_details_records(xml_payload)
+    if not any(record["route_rt_id"] and (record["route_abbreviation"] or record["short_name"]) for record in records):
+        raise ValueError("Route details contain no usable mappings")
+
+
 def load_pvta_route_details_xml(cache_path: Path | None = None) -> bytes | None:
     effective_cache_path = cache_path or get_pvta_route_details_cache_path()
     request = build_http_request(PVTA_ROUTE_DETAILS_URL)
-
     try:
-        LOGGER.info("Downloading PVTA route details from %s", PVTA_ROUTE_DETAILS_URL)
-        with urlopen(request, timeout=30) as response:
-            xml_payload = response.read()
-    except (OSError, URLError, HTTPError) as error:
-        LOGGER.warning("PVTA route details download failed: %s", error)
-        if not effective_cache_path.exists():
-            LOGGER.warning("PVTA route details cache is unavailable: %s", effective_cache_path)
-            return None
-
-        LOGGER.warning("Using cached PVTA route details XML: %s", effective_cache_path)
+        deadline = time.monotonic() + NETWORK_DEADLINE
+        with secure_open(request, deadline) as response:
+            xml_payload = read_bounded(response, MAX_XML_BYTES, deadline)
+        validate_pvta_route_details(xml_payload)
+    except (OSError, URLError, ValueError, ElementTree.ParseError, UnicodeDecodeError) as error:
+        LOGGER.warning("PVTA route details download or validation failed: %s", error)
         try:
-            return effective_cache_path.read_bytes()
-        except OSError as cache_error:
-            LOGGER.warning("PVTA route details cache could not be read: %s", cache_error)
+            if effective_cache_path.is_symlink():
+                raise ValueError("Route details cache is a symlink")
+            with effective_cache_path.open("rb") as source:
+                xml_payload = source.read(MAX_XML_BYTES + 1)
+            validate_pvta_route_details(xml_payload)
+        except (OSError, ValueError, ElementTree.ParseError, UnicodeDecodeError) as cache_error:
+            LOGGER.warning("PVTA route details cache unavailable or invalid: %s", cache_error)
             return None
-
+        LOGGER.warning("Using validated cached PVTA route details: %s", effective_cache_path)
+        return xml_payload
     try:
         effective_cache_path.parent.mkdir(parents=True, exist_ok=True)
-        effective_cache_path.write_bytes(xml_payload)
+        with tempfile.NamedTemporaryFile(dir=effective_cache_path.parent, delete=False) as temp:
+            temp_path = Path(temp.name)
+            try:
+                temp.write(xml_payload)
+                temp.flush()
+                os.replace(temp_path, effective_cache_path)
+            finally:
+                temp_path.unlink(missing_ok=True)
     except OSError as cache_error:
         LOGGER.warning("PVTA route details XML could not be cached: %s", cache_error)
-    else:
-        LOGGER.info("Cached PVTA route details XML at %s", effective_cache_path)
-
     return xml_payload
 
 
@@ -790,7 +953,7 @@ def build_provider_route_rt_id_records(
 
     try:
         records = parse_pvta_route_details_records(xml_payload)
-    except (ElementTree.ParseError, json.JSONDecodeError, UnicodeDecodeError) as error:
+    except (ElementTree.ParseError, ValueError, UnicodeDecodeError) as error:
         LOGGER.warning("PVTA route details payload could not be parsed: %s", error)
         return []
 
