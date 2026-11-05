@@ -15,6 +15,8 @@ on:
         type: boolean
         default: false
 
+  workflow_call:
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
@@ -68,7 +70,7 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   sync:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/beta'
     needs:
       - tests
       - prepare-agencies
@@ -76,6 +78,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+    env:
+      RELEASE_CHANNEL: ${{ github.ref == 'refs/heads/beta' && 'beta' || 'production' }}
     strategy:
       fail-fast: false
       matrix:
@@ -124,7 +128,7 @@ jobs:
           mkdir -p logs
           rm -f "data/${AGENCY}.sqlite.zip" "data/${AGENCY}.release-notes.md" converter-status
           args=()
-          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$FORCE_UPDATE" = "true" ]; then
+          if [ "$RELEASE_CHANNEL" = "beta" ] || { [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$FORCE_UPDATE" = "true" ]; }; then
             args+=(--force-update)
           fi
           python scripts/convert.py --agency "$AGENCY" --cleanup-extracted --status-file converter-status "${args[@]}" 2>&1 | tee "logs/${AGENCY}.log"
@@ -155,7 +159,7 @@ jobs:
 
       - name: Capture Current Production Asset
         id: previous_asset
-        if: steps.check_file.outputs.created == 'true'
+        if: env.RELEASE_CHANNEL == 'production' && steps.check_file.outputs.created == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -175,14 +179,14 @@ jobs:
           fi
 
       - name: Create Archive Release
-        if: steps.check_file.outputs.created == 'true'
+        if: env.RELEASE_CHANNEL == 'production' && steps.check_file.outputs.created == 'true'
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ matrix.agency }}-${{ steps.timestamp.outputs.value }}
           name: ${{ matrix.agency }} Archive ${{ steps.timestamp.outputs.value }}
           files: data/${{ matrix.agency }}.sqlite.zip
           body_path: data/${{ matrix.agency }}.release-notes.md
-          draft: false
+          draft: true
           prerelease: false
           make_latest: false
           append_body: false
@@ -206,7 +210,7 @@ jobs:
           generate_release_notes: false
 
       - name: Create or Update Production Release
-        if: steps.check_file.outputs.created == 'true'
+        if: env.RELEASE_CHANNEL == 'production' && steps.check_file.outputs.created == 'true'
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ matrix.agency }}
@@ -215,6 +219,20 @@ jobs:
           body_path: data/${{ matrix.agency }}.release-notes.md
           draft: false
           prerelease: false
+          make_latest: false
+          append_body: false
+          generate_release_notes: false
+
+      - name: Create or Update Beta Prerelease
+        if: env.RELEASE_CHANNEL == 'beta' && steps.check_file.outputs.created == 'true'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: ${{ matrix.agency }}-prerelease
+          name: ${{ matrix.agency }} Prerelease ${{ steps.timestamp.outputs.value }}
+          files: data/${{ matrix.agency }}.sqlite.zip
+          body_path: data/${{ matrix.agency }}.release-notes.md
+          draft: false
+          prerelease: true
           make_latest: false
           append_body: false
           generate_release_notes: false

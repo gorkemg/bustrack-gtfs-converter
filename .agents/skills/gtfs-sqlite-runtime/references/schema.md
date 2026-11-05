@@ -63,7 +63,7 @@ All values are physically stored as `TEXT`, but their semantic meaning differs:
 | `feed_start_date` | Effective service period start | GTFS date string `YYYYMMDD` | `20260501` |
 | `feed_end_date` | Effective service period end | GTFS date string `YYYYMMDD` | `20261231` |
 | `gtfs_source_filename` | Local extracted folder name used as source | String | `pvta` |
-| `schema_version` | App-facing schema contract version | String | `1.0` |
+| `schema_version` | App-facing schema contract version | String | `1.2` |
 
 Notes:
 
@@ -84,9 +84,9 @@ Meaning:
 - `route_rt_id` is the app/realtime-facing route identifier.
 - For most agencies, it defaults to `route_id`.
 - For `pvta`, the converter tries to map GTFS routes to provider realtime route IDs using the PVTA route details feed at:
-  - `http://bustracker.pvta.com/InfoPoint/rest/routedetails/getallroutedetails`
+  - `https://bustracker.pvta.com/InfoPoint/rest/routedetails/getallroutedetails`
 - That payload is cached locally at:
-  - `internal/assets/cache/pvta_routedetails.xml`
+  - `internal/assets/cache/pvta_routedetails_https_v2.json`
 
 PVTA matching priority:
 
@@ -95,6 +95,92 @@ PVTA matching priority:
 3. GTFS `routes.route_id` -> provider `RouteAbbreviation`
 
 If no PVTA match is found, `route_rt_id` falls back to `route_id`.
+
+### `canonical_routes` and `canonical_route_stops` (schema_version >= 1.1)
+
+The converter derives one canonical, maximum-extent stop ordering per `(route_id, direction_id)` by merging all trip variants (including short-turn trips) into a directed graph and flattening it with a topological sort (the "topological superset"). This gives linear UI components (e.g. Live Activity progress bars) a single stable stop axis per direction.
+
+```sql
+CREATE TABLE canonical_routes (
+  route_id TEXT,
+  direction_id INTEGER,
+  direction_label TEXT,
+  start_stop_id TEXT,
+  end_stop_id TEXT,
+  total_distance REAL,
+  PRIMARY KEY (route_id, direction_id)
+);
+
+CREATE TABLE canonical_route_stops (
+  route_id TEXT,
+  direction_id INTEGER,
+  stop_id TEXT,
+  superset_sequence INTEGER,
+  progress_ratio REAL,
+  PRIMARY KEY (route_id, direction_id, stop_id),
+  FOREIGN KEY (route_id, direction_id) REFERENCES canonical_routes(route_id, direction_id)
+);
+```
+
+Semantics:
+
+- `route_id` is the GTFS route ID (join to `routes.route_id`; map to `route_rt_id` via `routes` when talking to realtime APIs).
+- `direction_id` is the GTFS direction; feeds without a `direction_id` column collapse to `0`.
+- `direction_label` is the most frequent non-empty `trip_headsign` of the direction group (ties resolved by the longest trip, then lexicographically); empty string when no headsign exists.
+- `superset_sequence` starts at `0` and orders stops along the canonical line.
+- `progress_ratio` is the cumulative haversine distance up to the stop divided by `total_distance` (meters); the first stop is exactly `0.0`, the last exactly `1.0`. When no coordinates are usable, ratios fall back to uniform spacing and `total_distance` is `0.0`.
+- Each stop appears at most once per `(route_id, direction_id)`; cycles in the merged graph (loop routes, feed anomalies) are broken by removing the lowest-frequency edge, so ring services are approximated linearly.
+- Groups that cannot form a line (fewer than 2 connected stops) are skipped.
+- The `FOREIGN KEY` clause is declarative only; SQLite does not enforce it without `PRAGMA foreign_keys`.
+- Both tables are dropped and recreated on every conversion run.
+
+Indexes:
+
+- `canonical_route_stops (route_id, direction_id, superset_sequence)` — ordered read path for one direction
+- `canonical_route_stops (stop_id)` — reverse lookup from a stop to its canonical positions
+
+### `canonical_stop_counterparts` (schema_version >= 1.2)
+
+GTFS has no standard link between a stop and its opposite-direction twin across the street. The converter derives that link per `(route_id, direction_id)` from the canonical tables so apps can offer a "switch direction" affordance on a stop page.
+
+```sql
+CREATE TABLE canonical_stop_counterparts (
+  route_id TEXT,
+  direction_id INTEGER,
+  stop_id TEXT,
+  counterpart_stop_id TEXT,
+  counterpart_direction_id INTEGER,
+  counterpart_distance REAL,
+  match_type TEXT,
+  PRIMARY KEY (route_id, direction_id, stop_id),
+  FOREIGN KEY (route_id, direction_id) REFERENCES canonical_routes(route_id, direction_id)
+);
+```
+
+Semantics:
+
+- One row per stop of a canonical direction group whose route also has an opposite direction group. Loop routes and one-directional groups produce no rows — the absence of a row means "no direction switch possible here" and is intentional.
+- `counterpart_stop_id` is a stop of the **same route** in the **opposite direction** (`counterpart_direction_id = 1 - direction_id`).
+- `counterpart_distance` is the haversine distance in meters (`0.0` for `same_stop`; `NULL` when coordinates are missing).
+- `match_type` explains the pairing provenance:
+  - `same_stop` — the stop itself serves both directions (terminals, hubs); no street crossing needed.
+  - `parent_station` — both stops share a GTFS `parent_station` (authoritative; no distance/mirror constraint).
+  - `paired` — geometric match: nearest opposite-direction stop within 150 m whose mirrored linear position (`|p - (1 - p_counterpart)| <= 0.15`) confirms it lies on the corresponding section of the line.
+- Pairings are computed independently per direction, so rows are not guaranteed to be perfectly symmetric.
+- For a human-readable direction hint, join the counterpart to `canonical_routes` and display its `direction_label`:
+
+```sql
+SELECT c.counterpart_stop_id, s.stop_name, r.direction_label, c.match_type
+FROM canonical_stop_counterparts c
+JOIN canonical_routes r
+  ON r.route_id = c.route_id AND r.direction_id = c.counterpart_direction_id
+JOIN stops s ON s.stop_id = c.counterpart_stop_id
+WHERE c.stop_id = ?;
+```
+
+Index:
+
+- `canonical_stop_counterparts (stop_id)` — lookup of all counterpart rows for a stop page
 
 ## Why agency artifacts differ
 
@@ -147,6 +233,8 @@ After building the DB, the converter validates:
 
 - row counts per GTFS file match CSV-to-SQLite
 - `stops`, `trips`, and `stop_times` are not empty
+- `canonical_routes` exists and is not empty
+- `canonical_stop_counterparts` exists (may be empty for loop-only feeds)
 - `app_metadata` exists and is populated by the build flow
 
 ## Good inspection queries

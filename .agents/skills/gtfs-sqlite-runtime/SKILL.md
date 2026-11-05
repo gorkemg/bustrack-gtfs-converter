@@ -14,6 +14,8 @@ Use this skill for any task that touches the generated `.sqlite` or `.sqlite.zip
 - Empty CSV values are imported as `NULL`.
 - The converter adds a project-specific `app_metadata` table.
 - The converter also adds `routes.route_rt_id`, which does not exist in standard GTFS.
+- The converter derives project-specific `canonical_routes` and `canonical_route_stops` tables (schema_version >= 1.1): one merged, maximum-extent stop ordering per `(route_id, direction_id)` with `progress_ratio` values from `0.0` to `1.0` for linear UI rendering.
+- The converter derives a project-specific `canonical_stop_counterparts` table (schema_version >= 1.2): per `(route_id, direction_id)` the opposite-direction twin of each stop, for "switch direction" UI. Absence of a row means no counterpart exists (e.g. loop routes).
 - The converter creates app-oriented indexes, but it does not add GTFS foreign keys or primary key constraints.
 - Release assets are published by agency tag, not via a generic "latest" release contract.
 - Scheduled upstream update checks run on a fixed UTC cadence, but GitHub Actions scheduling is best-effort rather than punctual.
@@ -64,7 +66,7 @@ sqlite3 data/pvta.sqlite "SELECT name, sql FROM sqlite_master WHERE type IN ('ta
 - Do not describe `app_metadata` or `route_rt_id` as part of upstream GTFS. They are repository-specific additions.
 - Do not assume every generated DB came from the same agency; verify `app_metadata.agency_id`.
 - Do not coerce GTFS time strings into naive local datetimes.
-- Do not assume release discovery via "latest". Use explicit tags such as `pvta`, `pvta-previous`, or `pvta-YYYYMMDD-HHMM`.
+- Do not assume release discovery via "latest". Use explicit tags such as `pvta`, `pvta-previous`, or `pvta-prerelease`. The `pvta-prerelease` tag is a beta-channel artifact built from the `beta` branch and must not be given to production clients. Archive snapshots are untagged maintainer-only draft releases and cannot be downloaded via tag URLs.
 - Do not assume the database enforces relational integrity for you.
 - Do not assume all agencies expose the same table set, column set, or `route_rt_id` behavior.
 - Do not tell other agents to poll exactly at the cron timestamp without allowing for GitHub scheduler lag.

@@ -19,13 +19,23 @@ The repository keeps feed processing out of the production app stack. Conversion
 
 To ensure zero-downtime and high reliability for mobile end-users, this repository employs a triple-tier release model.
 
-| Tier | Tag Format | Scope | Purpose |
+| Tier | Tag / Format | Scope | Purpose |
 | :--- | :--- | :--- | :--- |
 | **Production** | `{agency}` | Stable | Primary endpoint for production mobile applications. |
 | **Previous** | `{agency}-previous` | Backup | Immediate rollback point in case of data inconsistencies. |
-| **Archive** | `{agency}-YYYYMMDD-HHMM` | Historical | Immutable record for audit trails and regression testing. |
+| **Archive** | Draft release `{agency} Archive YYYYMMDD-HHMM` (untagged) | Historical | Immutable record for audit trails and regression testing. Stored as maintainer-only draft releases so archive runs do not clutter the tags page. |
+| **Beta** | `{agency}-prerelease` | Testing | Rolling pre-release built from the `beta` branch for app-side testing. |
 
 The repository does not rely on GitHub's global `Latest` badge. Clients are expected to fetch explicit agency tags such as `pvta` or `uta`.
+
+### Beta Channel
+
+Every push to the `beta` branch triggers the sync workflow in beta mode (see `.github/workflows/gtfs-beta-prerelease.yml`):
+
+- The converter always runs with `--force-update`, so an artifact is produced even when the upstream GTFS feed is unchanged — the point is to test converter changes, not feed changes.
+- The result is published as a GitHub pre-release under the rolling tag `{agency}-prerelease`, with the asset name `{agency}.sqlite.zip` replaced on each run.
+- Production tags (`{agency}`, `{agency}-previous`, archive tags) are never created or modified by beta runs, so production clients remain unaffected.
+- Scheduled runs and `config/agencies.json` pushes on `main` continue to publish through the production tiers only.
 
 ### Sync Cadence and Release Timing
 
@@ -61,13 +71,21 @@ Every generated SQLite database contains an `app_metadata` table. This serves as
 | :--- | :--- |
 | `agency_id` | Unique identifier (e.g., `pvta`, `uta`) to prevent cross-agency data loading. |
 | `build_timestamp` | ISO-8601 timestamp of the conversion process. |
-| `schema_version` | Internal versioning of the database structure. |
+| `schema_version` | Internal versioning of the database structure. Current version: `1.2` (adds canonical route tables and opposite-direction stop counterparts). |
 | `git_commit_sha` | The exact version of the conversion logic used. |
 | `workflow_run_id` | Reference to the GitHub Action run for full traceability. |
 | `feed_start_date` | Commencement date of the GTFS schedule validity. |
 | `feed_end_date` | Expiration date of the GTFS schedule validity. |
 
 `feed_start_date` and `feed_end_date` are resolved from `feed_info.txt` when available, with a fallback to `calendar.txt`.
+
+---
+
+## Canonical Routes (Topological Superset)
+
+Since `schema_version` `1.1`, every database additionally contains two derived tables: `canonical_routes` and `canonical_route_stops`. For each `(route_id, direction_id)` pair, the converter merges all trip variants — including short-turn trips — into a weighted directed graph and flattens it via topological sort into a single maximum-extent stop ordering. Each stop carries a `progress_ratio` (`0.0` at the first stop, `1.0` at the last, based on cumulative haversine distance), which lets linear UI components such as Live Activities position a vehicle on one stable axis per direction. Cycles caused by loop routes or feed anomalies are broken deterministically by removing the lowest-frequency edge. Full column semantics are documented in `.agents/skills/gtfs-sqlite-runtime/references/schema.md`.
+
+Since `schema_version` `1.2`, the derived table `canonical_stop_counterparts` additionally links each stop to its opposite-direction twin per route ("the stop across the street"). Matching prefers GTFS `parent_station` grouping where present, otherwise pairs the nearest opposite-direction stop within 150 m whose mirrored `progress_ratio` confirms the corresponding line section. Loop routes yield no counterpart rows by design.
 
 ---
 
@@ -138,6 +156,7 @@ The pipeline currently validates:
 - successful GTFS file discovery
 - row counts between CSV input and SQLite output
 - non-empty `stops`, `trips`, and `stop_times` tables
+- presence of the derived `canonical_routes` (non-empty) and `canonical_stop_counterparts` tables; an empty counterpart table is allowed because loop-only feeds legitimately produce no counterparts
 - release provenance fields in `app_metadata`
 
 ## Repository Layout

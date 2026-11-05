@@ -19,10 +19,15 @@ class ReleaseValidationTests(unittest.TestCase):
         self.database = self.root / 'pvta.sqlite'
         with sqlite3.connect(self.database) as db:
             db.execute('CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT)')
-            db.executemany('INSERT INTO app_metadata VALUES (?, ?)', [('agency_id', 'pvta'), ('schema_version', '1.0')])
+            db.executemany('INSERT INTO app_metadata VALUES (?, ?)', [('agency_id', 'pvta'), ('schema_version', '1.2'), ('build_timestamp', '2026-01-01T00:00:00+00:00'), ('build_id', '550e8400-e29b-41d4-a716-446655440000'), ('git_commit_sha', ''), ('workflow_run_id', ''), ('feed_start_date', '20260101'), ('feed_end_date', '20261231'), ('gtfs_source_filename', 'pvta')])
             for table in ('stops', 'trips', 'stop_times'):
                 db.execute(f'CREATE TABLE {table} (id TEXT)')
                 db.execute(f"INSERT INTO {table} VALUES ('1')")
+            db.execute('CREATE TABLE canonical_routes (route_id TEXT, direction_id INTEGER, start_stop_id TEXT, end_stop_id TEXT)')
+            db.execute("INSERT INTO canonical_routes VALUES ('r', 0, 'a', 'b')")
+            db.execute('CREATE TABLE canonical_route_stops (route_id TEXT, direction_id INTEGER, stop_id TEXT, superset_sequence INTEGER, progress_ratio REAL)')
+            db.executemany('INSERT INTO canonical_route_stops VALUES (?, ?, ?, ?, ?)', [('r', 0, 'a', 0, 0.0), ('r', 0, 'b', 1, 1.0)])
+            db.execute('CREATE TABLE canonical_stop_counterparts (route_id TEXT, direction_id INTEGER, stop_id TEXT, counterpart_stop_id TEXT, counterpart_direction_id INTEGER, counterpart_distance REAL, match_type TEXT)')
         self.archive = self.root / 'pvta.sqlite.zip'
 
     def make_archive(self, name='pvta.sqlite', content=None):
@@ -73,8 +78,21 @@ class ReleaseValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_release(self.archive, 'pvta')
         with sqlite3.connect(self.database) as db:
-            db.execute("UPDATE app_metadata SET value='1.0' WHERE key='schema_version'")
+            db.execute("UPDATE app_metadata SET value='1.2' WHERE key='schema_version'")
             db.execute('DELETE FROM stops')
+        self.make_archive()
+        with self.assertRaises(ValueError):
+            validate_release(self.archive, 'pvta')
+
+    def test_rejects_invalid_canonical_data(self):
+        with sqlite3.connect(self.database) as db:
+            db.execute("UPDATE canonical_route_stops SET progress_ratio=0.5 WHERE stop_id='b'")
+        self.make_archive()
+        with self.assertRaises(ValueError):
+            validate_release(self.archive, 'pvta')
+        with sqlite3.connect(self.database) as db:
+            db.execute("UPDATE canonical_route_stops SET progress_ratio=1 WHERE stop_id='b'")
+            db.execute("INSERT INTO canonical_stop_counterparts VALUES ('r', 0, 'a', 'z', 1, 0, 'paired')")
         self.make_archive()
         with self.assertRaises(ValueError):
             validate_release(self.archive, 'pvta')
