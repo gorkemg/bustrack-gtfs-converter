@@ -664,7 +664,7 @@ class ConvertTests(unittest.TestCase):
                 ):
                     with patch(
                         "scripts.convert.get_pvta_route_details_cache_path",
-                        return_value=temp_root / "cache" / "pvta_routedetails.xml",
+                        return_value=temp_root / "cache" / "pvta_routedetails_https_v2.json",
                     ):
                         with patch("scripts.convert.secure_open", return_value=BytesIO(xml_payload)):
                             with patch(
