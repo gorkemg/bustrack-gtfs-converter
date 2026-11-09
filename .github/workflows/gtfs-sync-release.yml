@@ -180,7 +180,7 @@ jobs:
 
       - name: Create Archive Release
         if: env.RELEASE_CHANNEL == 'production' && steps.check_file.outputs.created == 'true'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: ${{ matrix.agency }}-${{ steps.timestamp.outputs.value }}
           name: ${{ matrix.agency }} Archive ${{ steps.timestamp.outputs.value }}
@@ -194,7 +194,7 @@ jobs:
 
       - name: Create or Update Previous Release
         if: steps.previous_asset.outputs.available == 'true'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: ${{ matrix.agency }}-previous
           name: ${{ matrix.agency }} Previous ${{ steps.timestamp.outputs.value }}
@@ -211,7 +211,7 @@ jobs:
 
       - name: Create or Update Production Release
         if: env.RELEASE_CHANNEL == 'production' && steps.check_file.outputs.created == 'true'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: ${{ matrix.agency }}
           name: ${{ matrix.agency }} Production ${{ steps.timestamp.outputs.value }}
@@ -225,7 +225,7 @@ jobs:
 
       - name: Create or Update Beta Prerelease
         if: env.RELEASE_CHANNEL == 'beta' && steps.check_file.outputs.created == 'true'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: ${{ matrix.agency }}-prerelease
           name: ${{ matrix.agency }} Prerelease ${{ steps.timestamp.outputs.value }}
