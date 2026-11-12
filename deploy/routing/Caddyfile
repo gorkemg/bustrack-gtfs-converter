@@ -1,0 +1,28 @@
+# Routing node. ROUTING_HOST and MOTIS_TOKEN come from /etc/caddy/motis.env
+# (systemd drop-in, see install.sh). Only the BusTrack backend calls this host.
+{
+	admin localhost:2019
+}
+
+{$ROUTING_HOST} {
+	encode zstd gzip
+
+	@authorized {
+		header Authorization "Bearer {$MOTIS_TOKEN}"
+		path /api/*
+	}
+	handle @authorized {
+		import /etc/caddy/motis-upstream.caddy
+	}
+	handle {
+		respond 401
+	}
+
+	log {
+		output file /var/log/caddy/routing.log {
+			roll_size 20MiB
+			roll_keep 5
+		}
+		format json
+	}
+}

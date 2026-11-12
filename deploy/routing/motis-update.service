@@ -1,0 +1,11 @@
+[Unit]
+Description=Fetch and activate the latest BusTrack MOTIS dataset
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# MOTIS_CHANNEL=production|beta, optional GITHUB_TOKEN for API rate limits.
+EnvironmentFile=-/etc/default/motis-update
+ExecStart=/usr/bin/python3 -I /srv/motis/motis_update.py update
+TimeoutStartSec=30min
