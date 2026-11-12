@@ -164,7 +164,9 @@ def smoke_error(plan: dict, agency_id: str) -> str | None:
 
 
 def caddy_upstream(port: int) -> str:
-    return f"reverse_proxy 127.0.0.1:{port}\n"
+    # MOTIS answers 400 "malformed URI or request" to any Authorization
+    # header, and it has no use for the bearer token anyway.
+    return f"reverse_proxy 127.0.0.1:{port} {{\n\theader_up -Authorization\n}}\n"
 
 
 def safe_members(archive: tarfile.TarFile) -> list[tarfile.TarInfo]:
