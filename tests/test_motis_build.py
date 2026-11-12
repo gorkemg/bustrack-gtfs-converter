@@ -79,6 +79,9 @@ class MotisBuildTests(unittest.TestCase):
         self.assertEqual(info["inputs"]["pvta.gtfs.zip"], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         self.assertEqual(info["channel"], "beta")
         self.assertEqual(info["built_at"], "2026-11-12T00:00:00Z")
+        self.assertEqual(info["motis_version"], self.config["motis"]["version"])
+        first = self.config["agencies"][0]
+        self.assertEqual(info["smoke_trips"][first["id"]]["from"], first["smoke_trip"]["from"])
 
 
 if __name__ == "__main__":

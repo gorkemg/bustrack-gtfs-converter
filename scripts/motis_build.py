@@ -153,7 +153,17 @@ def build_info(config: dict, inputs: dict[str, Path], channel: str, now: datetim
         "channel": channel,
         "built_at": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "motis_version": config["motis"]["version"],
+        "motis_sha256": config["motis"].get("sha256", ""),
         "agencies": [agency["id"] for agency in config["agencies"]],
+        # The routing server repeats the CI smoke test before it swaps.
+        "smoke_trips": {
+            agency["id"]: {
+                "timezone": agency["timezone"],
+                "from": agency["smoke_trip"]["from"],
+                "to": agency["smoke_trip"]["to"],
+            }
+            for agency in config["agencies"]
+        },
         "inputs": {name: file_sha256(path) for name, path in sorted(inputs.items())},
     }
 

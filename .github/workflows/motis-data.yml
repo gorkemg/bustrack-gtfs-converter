@@ -165,7 +165,8 @@ jobs:
           # as the routing server will, to prove no input file is needed.
           mkdir -p smoke
           tar -C smoke -I zstd -xf motis-data.tar.zst
-          ( cd smoke && ../motis/motis server > ../server.log 2>&1 & echo $! > ../server.pid )
+          ( cd smoke && exec ../motis/motis server > ../server.log 2>&1 ) &
+          echo $! > server.pid
           status=0
           python scripts/motis_build.py smoke --base-url http://127.0.0.1:8080 --timeout 180 || status=$?
           ps -o rss=,vsz= -p "$(cat server.pid)" | awk '{printf "Server RSS after smoke test: %.0f MB\n", $1/1024}' | tee -a "$GITHUB_STEP_SUMMARY" || true

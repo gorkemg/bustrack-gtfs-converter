@@ -134,6 +134,8 @@ An agency also needs an entry in `config/routing.json` (bounding box, Geofabrik 
 
 Steps: download `{agency}.gtfs.zip` from the agency releases, clip Geofabrik OSM extracts to each `bbox` with osmium and merge them, run `motis import` with the pinned version from `config/routing.json`, then serve the packaged `data/` from a fresh directory and query `/api/v6/plan` for each agency's `smoke_trip`. Assets: `motis-data.tar.zst` (contains `data/`, including `config.yml` and `build-info.json`), its `.sha256`, and `build-info.json`. The routing server only downloads, verifies and swaps this package; `motis server` needs nothing but `data/`. Dataset tags equal agency ids, so MOTIS trip ids read `{date}_{time}_{agency}_{gtfs_trip_id}`.
 
+The routing node pulls this package itself: `deploy/routing/` holds the updater (`motis_update.py`, blue/green swap with health and smoke test, rollback), the systemd units, the Caddy config with bearer-token auth, and `install.sh`. See [deploy/routing/README.md](deploy/routing/README.md).
+
 ### Agency-Specific SQLite Differences
 
 Generated SQLite artifacts are intentionally not identical across agencies. The main reasons are upstream GTFS heterogeneity and one repository-specific enrichment path.
@@ -181,6 +183,7 @@ The pipeline currently validates:
 - `config/routing.json`: MOTIS version and per-agency routing inputs (bbox, OSM extract, GTFS-RT, smoke trip)
 - `scripts/motis_build.py`: MOTIS config generation, OSM clip commands, smoke test and build metadata
 - `.github/workflows/motis-data.yml`: builds and publishes the MOTIS routing dataset
+- `deploy/routing/`: routing node setup and pull-based dataset updater
 - `data/`: generated runtime artifacts; keep only placeholder files in git
 - `.github/workflows/gtfs-sync-release.yml`: scheduled and config-triggered sync, validation, and archive/previous/production publishing with a dynamic agency matrix
 - `.github/workflows/rollback.yml`: manual rollback from `previous` to `production` with agency validation against `config/agencies.json`
