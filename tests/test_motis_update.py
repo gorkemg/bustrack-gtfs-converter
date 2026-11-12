@@ -104,7 +104,9 @@ class MotisUpdateTests(unittest.TestCase):
             motis_update.safe_members(_tar([link]))
 
     def test_caddy_upstream(self) -> None:
-        self.assertEqual(motis_update.caddy_upstream(8081), "reverse_proxy 127.0.0.1:8081\n")
+        upstream = motis_update.caddy_upstream(8081)
+        self.assertTrue(upstream.startswith("reverse_proxy 127.0.0.1:8081 {"))
+        self.assertIn("header_up -Authorization", upstream)
 
 
 if __name__ == "__main__":
