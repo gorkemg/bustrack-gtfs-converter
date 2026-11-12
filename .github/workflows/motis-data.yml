@@ -1,0 +1,212 @@
+name: MOTIS Routing Data
+
+# Builds the preprocessed MOTIS dataset (transit + walking + geocoding) for all
+# agencies in config/routing.json and publishes it as a release asset. The
+# routing server only downloads and swaps this package; it never imports.
+#
+# Inputs: the normalized {agency}.gtfs.zip assets of the converter releases
+# ({agency} for production, {agency}-prerelease for beta) and Geofabrik OSM
+# extracts clipped to each agency's bounding box.
+# Output: release `motis` (production) or `motis-prerelease` (beta) with
+# motis-data.tar.zst, motis-data.tar.zst.sha256 and build-info.json.
+
+on:
+  workflow_run:
+    workflows: ["GTFS Sync & Release"]
+    types: [completed]
+    branches: [main]
+  schedule:
+    # Weekly refresh of the OSM street network and the MOTIS timetable window.
+    - cron: '40 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Release channel to build'
+        type: choice
+        options: [production, beta]
+        default: beta
+  workflow_call:
+    inputs:
+      channel:
+        type: string
+        required: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: motis-data-${{ inputs.channel || 'production' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      CHANNEL: ${{ inputs.channel || 'production' }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.11'
+
+      - name: Validate Routing Config
+        run: python -m unittest tests.test_motis_build -v
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq osmium-tool zstd
+
+      - name: Download Normalized GTFS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p build
+          suffix=""
+          if [ "$CHANNEL" = "beta" ]; then suffix="-prerelease"; fi
+          for agency in $(python -c 'import json; print(" ".join(a["id"] for a in json.load(open("config/routing.json"))["agencies"]))'); do
+            gh release download "${agency}${suffix}" --repo "$GITHUB_REPOSITORY" \
+              --pattern "${agency}.gtfs.zip" --dir build --clobber || {
+                echo "::error::Release ${agency}${suffix} has no ${agency}.gtfs.zip yet. Run 'GTFS Sync & Release' with force_update first." >&2
+                exit 1
+              }
+          done
+          ls -la build
+
+      - name: Prepare OSM Cache Key
+        run: echo "OSM_WEEK=$(date -u +'%G-W%V')" >> "$GITHUB_ENV"
+
+      - name: Restore OSM Clips
+        id: osm_cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: osm/*-clip.osm.pbf
+          key: osm-clips-${{ hashFiles('config/routing.json') }}-${{ env.OSM_WEEK }}
+
+      - name: Download And Clip OSM
+        if: steps.osm_cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p osm
+          python - <<'PY' > osm/sources.tsv
+          import json
+          for agency in json.load(open("config/routing.json"))["agencies"]:
+              print(f"{agency['id']}\t{agency['osm_url']}")
+          PY
+          while IFS=$'\t' read -r agency url; do
+            curl --fail --location --retry 4 --retry-delay 10 --proto '=https' \
+              --output "osm/${agency}-source.osm.pbf" "$url"
+          done < osm/sources.tsv
+          python scripts/motis_build.py clip-commands | while read -r line; do
+            echo "+ $line"
+            $line
+          done
+          rm -f osm/*-source.osm.pbf
+          ls -la osm
+
+      - name: Merge OSM Clips
+        run: |
+          osmium merge --overwrite osm/*-clip.osm.pbf -o build/merged.osm.pbf
+          ls -la build/merged.osm.pbf
+
+      - name: Download MOTIS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(python -c 'import json; print(json.load(open("config/routing.json"))["motis"]["version"])')
+          expected=$(python -c 'import json; print(json.load(open("config/routing.json"))["motis"].get("sha256", ""))')
+          mkdir -p motis
+          gh release download "v${version}" --repo motis-project/motis \
+            --pattern 'motis-linux-amd64.tar.bz2' --dir motis --clobber
+          actual=$(sha256sum motis/motis-linux-amd64.tar.bz2 | cut -d' ' -f1)
+          echo "MOTIS v${version} sha256: ${actual}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
+            echo "::error::MOTIS archive checksum mismatch: expected ${expected}, got ${actual}" >&2
+            exit 1
+          fi
+          if [ -z "$expected" ]; then
+            echo "::warning::config/routing.json motis.sha256 is empty; pin ${actual}"
+          fi
+          tar -xjf motis/motis-linux-amd64.tar.bz2 -C motis
+          test -x motis/motis
+
+      - name: Import
+        working-directory: build
+        run: |
+          python ../scripts/motis_build.py config --out config.yml
+          cat config.yml
+          /usr/bin/time -v ../motis/motis import 2> import-time.log
+          grep -E 'Maximum resident set size|Elapsed \(wall clock\)' import-time.log | tee -a "$GITHUB_STEP_SUMMARY"
+          test -f data/config.yml
+          du -sh data | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Package
+        run: |
+          python scripts/motis_build.py info --channel "$CHANNEL" --out build/data/build-info.json \
+            build/merged.osm.pbf build/*.gtfs.zip
+          cp build/data/build-info.json build-info.json
+          tar -C build -I 'zstd -19 -T0' -cf motis-data.tar.zst data
+          sha256sum motis-data.tar.zst > motis-data.tar.zst.sha256
+          ls -la motis-data.tar.zst
+          cat build-info.json
+
+      - name: Smoke Test Packaged Data
+        run: |
+          # Serve from a fresh directory that holds only the package, exactly
+          # as the routing server will, to prove no input file is needed.
+          mkdir -p smoke
+          tar -C smoke -I zstd -xf motis-data.tar.zst
+          ( cd smoke && ../motis/motis server > ../server.log 2>&1 & echo $! > ../server.pid )
+          status=0
+          python scripts/motis_build.py smoke --base-url http://127.0.0.1:8080 --timeout 180 || status=$?
+          ps -o rss=,vsz= -p "$(cat server.pid)" | awk '{printf "Server RSS after smoke test: %.0f MB\n", $1/1024}' | tee -a "$GITHUB_STEP_SUMMARY" || true
+          kill "$(cat server.pid)" || true
+          if [ "$status" -ne 0 ]; then tail -n 80 server.log; fi
+          exit "$status"
+
+      - name: Publish Production Release
+        if: env.CHANNEL == 'production'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: motis
+          name: MOTIS routing data (production)
+          files: |
+            motis-data.tar.zst
+            motis-data.tar.zst.sha256
+            build-info.json
+          body: |
+            Preprocessed MOTIS dataset for the routing server. Built from the production GTFS releases.
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          draft: false
+          prerelease: false
+          make_latest: false
+          append_body: false
+          generate_release_notes: false
+
+      - name: Publish Beta Prerelease
+        if: env.CHANNEL == 'beta'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: motis-prerelease
+          name: MOTIS routing data (beta)
+          files: |
+            motis-data.tar.zst
+            motis-data.tar.zst.sha256
+            build-info.json
+          body: |
+            Preprocessed MOTIS dataset for the beta routing server. Built from the {agency}-prerelease GTFS releases.
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          draft: false
+          prerelease: true
+          make_latest: false
+          append_body: false
+          generate_release_notes: false

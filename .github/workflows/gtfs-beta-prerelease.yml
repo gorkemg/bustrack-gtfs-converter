@@ -26,3 +26,12 @@ jobs:
     permissions:
       contents: write
     secrets: inherit
+
+  motis:
+    needs: beta
+    uses: ./.github/workflows/motis-data.yml
+    permissions:
+      contents: write
+    secrets: inherit
+    with:
+      channel: beta

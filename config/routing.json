@@ -1,0 +1,27 @@
+{
+  "motis": {
+    "version": "2.11.4",
+    "sha256": ""
+  },
+  "agencies": [
+    {
+      "id": "pvta",
+      "timezone": "America/New_York",
+      "osm_url": "https://download.geofabrik.de/north-america/us/massachusetts-latest.osm.pbf",
+      "bbox": [-72.9822, 41.8675, -72.1390, 42.5247],
+      "realtime": [],
+      "smoke_trip": {"from": [42.3570, -72.5480], "to": [42.3909, -72.5253]}
+    },
+    {
+      "id": "uta",
+      "timezone": "America/Denver",
+      "osm_url": "https://download.geofabrik.de/north-america/us/utah-latest.osm.pbf",
+      "bbox": [-112.8930, 39.6417, -111.3540, 41.8390],
+      "realtime": [
+        "https://apps.rideuta.com/tms/gtfs/TripUpdate",
+        "https://apps.rideuta.com/tms/gtfs/Alert"
+      ],
+      "smoke_trip": {"from": [40.7247, -111.8569], "to": [40.7623, -111.8460]}
+    }
+  ]
+}

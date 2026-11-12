@@ -26,6 +26,8 @@ To ensure zero-downtime and high reliability for mobile end-users, this reposito
 | **Archive** | Draft release `{agency} Archive YYYYMMDD-HHMM` (untagged) | Historical | Immutable record for audit trails and regression testing. Stored as maintainer-only draft releases so archive runs do not clutter the tags page. |
 | **Beta** | `{agency}-prerelease` | Testing | Rolling pre-release built from the `beta` branch for app-side testing. |
 
+Each agency release also carries `{agency}.gtfs.zip`: the same feed as a normalized GTFS archive (every field trimmed, times zero padded to `HH:MM:SS`). Routing engines consume it; UTA's source feed has times such as `" 4:15:00"` that strict parsers misread. The manual rollback restores only the SQLite asset.
+
 The repository does not rely on GitHub's global `Latest` badge. Clients are expected to fetch explicit agency tags such as `pvta` or `uta`.
 
 ### Beta Channel
@@ -119,6 +121,19 @@ That is sufficient for normal operation. The sync workflow derives its agency ma
 
 The rollback workflow also validates the entered agency ID against `config/agencies.json`, so no workflow edits are required when onboarding a new agency.
 
+An agency also needs an entry in `config/routing.json` (bounding box, Geofabrik extract, optional GTFS-RT URLs, smoke-test trip) so the routing dataset covers it; a test keeps both files in sync.
+
+### Routing Data (MOTIS)
+
+`.github/workflows/motis-data.yml` builds the preprocessed [MOTIS](https://github.com/motis-project/motis) dataset for directions:
+
+| Trigger | Channel | Release tag |
+| :--- | :--- | :--- |
+| `GTFS Sync & Release` finished on `main`, weekly Monday cron, manual dispatch | production | `motis` |
+| Push to `beta` (after the beta prerelease), manual dispatch | beta | `motis-prerelease` |
+
+Steps: download `{agency}.gtfs.zip` from the agency releases, clip Geofabrik OSM extracts to each `bbox` with osmium and merge them, run `motis import` with the pinned version from `config/routing.json`, then serve the packaged `data/` from a fresh directory and query `/api/v6/plan` for each agency's `smoke_trip`. Assets: `motis-data.tar.zst` (contains `data/`, including `config.yml` and `build-info.json`), its `.sha256`, and `build-info.json`. The routing server only downloads, verifies and swaps this package; `motis server` needs nothing but `data/`. Dataset tags equal agency ids, so MOTIS trip ids read `{date}_{time}_{agency}_{gtfs_trip_id}`.
+
 ### Agency-Specific SQLite Differences
 
 Generated SQLite artifacts are intentionally not identical across agencies. The main reasons are upstream GTFS heterogeneity and one repository-specific enrichment path.
@@ -163,6 +178,9 @@ The pipeline currently validates:
 
 - `scripts/convert.py`: end-to-end GTFS download, conversion, validation, packaging, and metadata generation
 - `config/agencies.json`: configured agencies and source URLs
+- `config/routing.json`: MOTIS version and per-agency routing inputs (bbox, OSM extract, GTFS-RT, smoke trip)
+- `scripts/motis_build.py`: MOTIS config generation, OSM clip commands, smoke test and build metadata
+- `.github/workflows/motis-data.yml`: builds and publishes the MOTIS routing dataset
 - `data/`: generated runtime artifacts; keep only placeholder files in git
 - `.github/workflows/gtfs-sync-release.yml`: scheduled and config-triggered sync, validation, and archive/previous/production publishing with a dynamic agency matrix
 - `.github/workflows/rollback.yml`: manual rollback from `previous` to `production` with agency validation against `config/agencies.json`
