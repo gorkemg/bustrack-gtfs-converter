@@ -395,6 +395,49 @@ class ConvertTests(unittest.TestCase):
             with zipfile.ZipFile(zip_path) as archive:
                 self.assertEqual(archive.namelist(), ["sample.sqlite"])
 
+    def test_normalize_gtfs_time_pads_and_strips(self) -> None:
+        self.assertEqual(convert.normalize_gtfs_time(" 4:15:00"), "04:15:00")
+        self.assertEqual(convert.normalize_gtfs_time("4:15:00"), "04:15:00")
+        self.assertEqual(convert.normalize_gtfs_time("25:01:59 "), "25:01:59")
+        self.assertEqual(convert.normalize_gtfs_time("104:00:00"), "104:00:00")
+        self.assertEqual(convert.normalize_gtfs_time(""), "")
+        self.assertEqual(convert.normalize_gtfs_time(" "), "")
+        self.assertEqual(convert.normalize_gtfs_time("4:5:00"), "4:5:00")
+
+    def test_write_normalized_gtfs_zip_cleans_times_and_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            feed = Path(temp_dir) / "feed"
+            feed.mkdir()
+            (feed / "stop_times.txt").write_text(
+                "\ufefftrip_id,arrival_time,departure_time,stop_id,stop_sequence,stop_headsign\n"
+                "t1, 4:15:00, 4:16:00,s1,1,\"Downtown, Main St\"\n"
+                "t1,25:00:00,25:00:00,s2,2,\n",
+                encoding="utf-8",
+            )
+            (feed / "stops.txt").write_text("stop_id,stop_name\ns1, A \ns2,B\n", encoding="utf-8")
+            zip_path = Path(temp_dir) / "agency.gtfs.zip"
+
+            changed = convert.write_normalized_gtfs_zip(sorted(feed.glob("*.txt")), zip_path)
+
+            self.assertEqual(changed, 3)
+            with zipfile.ZipFile(zip_path) as archive:
+                self.assertEqual(sorted(archive.namelist()), ["stop_times.txt", "stops.txt"])
+                stop_times = archive.read("stop_times.txt").decode("utf-8").splitlines()
+                stops = archive.read("stops.txt").decode("utf-8").splitlines()
+            self.assertEqual(stop_times[0], "trip_id,arrival_time,departure_time,stop_id,stop_sequence,stop_headsign")
+            self.assertEqual(stop_times[1], 't1,04:15:00,04:16:00,s1,1,"Downtown, Main St"')
+            self.assertEqual(stop_times[2], "t1,25:00:00,25:00:00,s2,2,")
+            self.assertEqual(stops[1], "s1,A")
+            self.assertFalse(zip_path.with_name(".agency.gtfs.zip.tmp").exists())
+
+    def test_write_normalized_gtfs_zip_rejects_ragged_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            feed = Path(temp_dir) / "feed"
+            feed.mkdir()
+            (feed / "stops.txt").write_text("stop_id,stop_name\ns1\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                convert.write_normalized_gtfs_zip([feed / "stops.txt"], Path(temp_dir) / "x.gtfs.zip")
+
     def test_cleanup_extracted_folder_removes_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target_dir = Path(temp_dir) / "agency"

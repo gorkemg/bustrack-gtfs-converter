@@ -126,7 +126,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p logs
-          rm -f "data/${AGENCY}.sqlite.zip" "data/${AGENCY}.release-notes.md" converter-status
+          rm -f "data/${AGENCY}.sqlite.zip" "data/${AGENCY}.gtfs.zip" "data/${AGENCY}.release-notes.md" converter-status
           args=()
           if [ "$RELEASE_CHANNEL" = "beta" ] || { [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$FORCE_UPDATE" = "true" ]; }; then
             args+=(--force-update)
@@ -143,6 +143,7 @@ jobs:
             generated)
               python scripts/validate_release.py "$AGENCY" "data/${AGENCY}.sqlite.zip"
               test -s "data/${AGENCY}.release-notes.md"
+              python -c 'import sys, zipfile; names = set(zipfile.ZipFile(sys.argv[1]).namelist()); missing = {"stops.txt", "trips.txt", "stop_times.txt", "routes.txt"} - names; sys.exit(f"normalized GTFS archive lacks {sorted(missing)}" if missing else 0)' "data/${AGENCY}.gtfs.zip"
               echo "created=true" >> "$GITHUB_OUTPUT" ;;
             *) echo "Missing or invalid converter result" >&2; exit 1 ;;
           esac
@@ -184,7 +185,9 @@ jobs:
         with:
           tag_name: ${{ matrix.agency }}-${{ steps.timestamp.outputs.value }}
           name: ${{ matrix.agency }} Archive ${{ steps.timestamp.outputs.value }}
-          files: data/${{ matrix.agency }}.sqlite.zip
+          files: |
+            data/${{ matrix.agency }}.sqlite.zip
+            data/${{ matrix.agency }}.gtfs.zip
           body_path: data/${{ matrix.agency }}.release-notes.md
           draft: true
           prerelease: false
@@ -215,7 +218,9 @@ jobs:
         with:
           tag_name: ${{ matrix.agency }}
           name: ${{ matrix.agency }} Production ${{ steps.timestamp.outputs.value }}
-          files: data/${{ matrix.agency }}.sqlite.zip
+          files: |
+            data/${{ matrix.agency }}.sqlite.zip
+            data/${{ matrix.agency }}.gtfs.zip
           body_path: data/${{ matrix.agency }}.release-notes.md
           draft: false
           prerelease: false
@@ -229,7 +234,9 @@ jobs:
         with:
           tag_name: ${{ matrix.agency }}-prerelease
           name: ${{ matrix.agency }} Prerelease ${{ steps.timestamp.outputs.value }}
-          files: data/${{ matrix.agency }}.sqlite.zip
+          files: |
+            data/${{ matrix.agency }}.sqlite.zip
+            data/${{ matrix.agency }}.gtfs.zip
           body_path: data/${{ matrix.agency }}.release-notes.md
           draft: false
           prerelease: true
