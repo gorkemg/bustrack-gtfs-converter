@@ -19,7 +19,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq python3 zstd curl debian-keyring debian-archive-keyring apt-transport-https ufw
+apt-get install -y -qq python3 zstd curl debian-keyring debian-archive-keyring apt-transport-https ufw \
+  unattended-upgrades update-notifier-common
 if ! command -v caddy >/dev/null; then
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list
@@ -34,11 +35,18 @@ if ! swapon --show=NAME --noheadings | grep -q '^/swapfile$'; then
   grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
 
+# Security updates install automatically; a required reboot happens at 09:00
+# UTC. Automatic-Reboot-Time is local time, so the node runs on UTC.
+timedatectl set-timezone Etc/UTC
+install -o root -g root -m 0644 "$here/20auto-upgrades" /etc/apt/apt.conf.d/20auto-upgrades
+install -o root -g root -m 0644 "$here/52bustrack-unattended-upgrades" /etc/apt/apt.conf.d/52bustrack-unattended-upgrades
+
 id motis >/dev/null 2>&1 || useradd --system --home-dir /srv/motis --shell /usr/sbin/nologin motis
-install -d -o root -g root -m 0755 /srv/motis /srv/motis/bin /srv/motis/downloads
+install -d -o root -g root -m 0755 /srv/motis /srv/motis/bin /srv/motis/downloads /srv/motis/public
 install -d -o motis -g motis -m 0755 /srv/motis/releases
 install -o root -g root -m 0755 "$here/motis_update.py" /srv/motis/motis_update.py
-install -o root -g root -m 0644 "$here/motis@.service" "$here/motis-update.service" "$here/motis-update.timer" /etc/systemd/system/
+install -o root -g root -m 0644 "$here/motis@.service" "$here/motis-update.service" "$here/motis-update.timer" \
+  "$here/routing-status.service" "$here/routing-status.timer" /etc/systemd/system/
 
 umask 077
 if [[ ! -f /etc/caddy/motis.env ]]; then
@@ -66,10 +74,14 @@ ufw allow 80/tcp >/dev/null
 ufw allow 443/tcp >/dev/null
 ufw --force enable >/dev/null
 
+# Refuse to restart Caddy into a broken config (it would take the API down).
+( set -a; . /etc/caddy/motis.env; set +a; caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile >/dev/null )
+
 systemctl daemon-reload
 systemctl enable caddy >/dev/null
 systemctl restart caddy
 systemctl enable --now motis-update.timer
+systemctl enable --now routing-status.timer
 echo "first update (downloads the dataset and MOTIS, then swaps):"
 systemctl start motis-update.service || { journalctl -u motis-update -n 50 --no-pager; exit 1; }
 python3 -I /srv/motis/motis_update.py status

@@ -20,6 +20,7 @@ motis_update.py ── verify sha256 ── extract to /srv/motis/releases/<id>
 | `/srv/motis/state.json` | active/previous release and colour |
 | `/etc/caddy/motis.env` | `ROUTING_HOST`, `MOTIS_TOKEN` (root:caddy 0640) |
 | `/etc/default/motis-update` | `MOTIS_CHANNEL=production` or `beta`, optional `GITHUB_TOKEN` |
+| `/srv/motis/public/status.json` | monitoring snapshot, rewritten every minute by `routing-status.timer` |
 
 ## Setup
 
@@ -39,3 +40,16 @@ A beta node uses `MOTIS_CHANNEL=beta`; one node per channel keeps beta experimen
 Swap strategy: with at least 700 MB available, the new colour starts beside the old one and traffic switches without a gap. Below that the updater stops the old colour first (a few seconds of 503 for the backend, which retries after 30 s) and restarts it if the new dataset fails its checks. Any failure leaves the previous dataset serving.
 
 Capacity: serving RSS was 180 to 490 MB for PVTA + UTA in the spike. Each additional city adds roughly its GTFS plus clipped OSM size; watch `systemctl status motis@<colour>` and raise `MemoryMax` together with the node size.
+
+## Monitoring
+
+The backend's alert engine watches this node (checks `routing.*`, see the backend README). The node only publishes data, it never pushes anything itself.
+
+| Route | Auth | Content |
+| :--- | :--- | :--- |
+| `/_status` | bearer token | `status.json`: boot id and time, memory, disk, load, pending (security) updates, `reboot-required`, active release and colour, `motis@<colour>` state, restarts and last result, updater success/failure counters |
+| `/healthz` | none | MOTIS `/api/v1/health` of the active colour, for the external watchdog |
+
+`motis_update.py report` writes the snapshot; every probe is best effort, a missing value is `null`. Pending updates come from `apt-check`, cached for an hour.
+
+Updates: `unattended-upgrades` installs security updates; when one needs a reboot the node reboots at 09:00 UTC (04:00 US Eastern). The backend treats a boot in 09:00 to 09:20 UTC after `reboot-required` as planned. After changing anything in this directory, re-run `install.sh` (idempotent; it validates the Caddyfile before restarting Caddy).

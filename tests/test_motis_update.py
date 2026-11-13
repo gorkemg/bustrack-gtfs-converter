@@ -111,3 +111,86 @@ class MotisUpdateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StatusReportTests(unittest.TestCase):
+    NOW = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+
+    def test_meminfo_fields(self) -> None:
+        text = "MemTotal: 1000 kB\nMemFree: 1 kB\nMemAvailable: 400 kB\nSwapTotal: 512 kB\nSwapFree: 500 kB\n"
+        self.assertEqual(
+            motis_update.parse_meminfo_all(text),
+            {"total_kb": 1000, "available_kb": 400, "swap_total_kb": 512, "swap_free_kb": 500},
+        )
+
+    def test_apt_check(self) -> None:
+        self.assertEqual(motis_update.parse_apt_check("12;3"), (12, 3))
+        self.assertIsNone(motis_update.parse_apt_check("E: something"))
+
+    def test_systemctl_show(self) -> None:
+        unit = motis_update.parse_systemctl_show("ActiveState=active\nNRestarts=2\nResult=oom-kill\nMemoryCurrent=[not set]\n")
+        self.assertEqual(unit, {"active_state": "active", "result": "oom-kill", "n_restarts": 2, "memory_bytes": None})
+
+    def test_record_run_counts_failures_and_resets(self) -> None:
+        import urllib.error
+
+        state = motis_update.record_run({}, self.NOW, urllib.error.URLError("github down"))
+        state = motis_update.record_run(state, self.NOW, RuntimeError("smoke test failed"))
+        self.assertEqual(state["consecutive_failures"], 2)
+        self.assertEqual(state["last_error_kind"], "node")
+        self.assertNotIn("last_success_at", state)
+        state = motis_update.record_run(state, self.NOW, None)
+        self.assertEqual(state["consecutive_failures"], 0)
+        self.assertEqual(state["last_success_at"], "2026-11-13T10:00:00Z")
+        self.assertNotIn("last_error_kind", state)
+
+    def test_classify_error(self) -> None:
+        import urllib.error
+
+        self.assertEqual(motis_update.classify_error(urllib.error.URLError("x")), "upstream")
+        self.assertEqual(motis_update.classify_error(TimeoutError()), "upstream")
+        self.assertEqual(motis_update.classify_error(RuntimeError("dataset checksum mismatch")), "node")
+
+    def test_build_status_shape(self) -> None:
+        state = {"active_release": "abc", "active_colour": "blue", "activated_by": "rollback", "consecutive_failures": 1, "last_error_kind": "upstream"}
+        snapshot = motis_update.build_status(
+            now=self.NOW, state=state, channel="beta", boot_id="b-1", uptime_seconds=3600.4,
+            meminfo={"total_kb": 1000, "available_kb": 400}, disk=(100, 40), load1=0.5,
+            reboot_required_since=datetime(2026, 11, 12, 6, 0, tzinfo=timezone.utc),
+            updates={"pending": 3, "security": 1}, unit={"active_state": "active"},
+        )
+        self.assertEqual(snapshot["v"], 1)
+        self.assertEqual(snapshot["host"]["booted_at"], "2026-11-13T09:00:00Z")
+        self.assertEqual(snapshot["host"]["uptime_s"], 3600)
+        self.assertTrue(snapshot["host"]["reboot_required"])
+        self.assertEqual(snapshot["host"]["reboot_required_since"], "2026-11-12T06:00:00Z")
+        self.assertEqual(snapshot["host"]["disk"], {"total_bytes": 100, "free_bytes": 40})
+        self.assertEqual(snapshot["motis"]["activated_by"], "rollback")
+        self.assertEqual(snapshot["updater"], {"last_check_at": None, "last_success_at": None, "consecutive_failures": 1, "last_error_kind": "upstream"})
+        self.assertNotIn("MOTIS_TOKEN", str(snapshot))
+
+    def test_build_status_tolerates_missing_probes(self) -> None:
+        snapshot = motis_update.build_status(
+            now=self.NOW, state={}, channel="production", boot_id=None, uptime_seconds=None,
+            meminfo={}, disk=None, load1=None, reboot_required_since=None, updates=None, unit=None,
+        )
+        self.assertIsNone(snapshot["host"]["booted_at"])
+        self.assertFalse(snapshot["host"]["reboot_required"])
+        self.assertIsNone(snapshot["host"]["memory"])
+        self.assertEqual(snapshot["updater"]["consecutive_failures"], 0)
+
+
+class ReportCommandTests(unittest.TestCase):
+    def test_report_writes_world_readable_snapshot(self) -> None:
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as root:
+            paths = motis_update.Paths(Path(root))
+            paths.state.write_text(json.dumps({"active_release": "r1"}), encoding="utf-8")
+            args = motis_update.parse_args(["--root", root, "report", "--channel", "beta"])
+            self.assertEqual(args.func(args, paths), 0)
+            data = json.loads(paths.status_file.read_text(encoding="utf-8"))
+            self.assertEqual(data["motis"]["active_release"], "r1")
+            self.assertEqual(data["motis"]["channel"], "beta")
+            self.assertEqual(paths.status_file.stat().st_mode & 0o777, 0o644)
