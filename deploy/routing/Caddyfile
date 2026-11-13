@@ -14,6 +14,27 @@
 	handle @authorized {
 		import /etc/caddy/motis-upstream.caddy
 	}
+
+	# Monitoring snapshot for the backend's alert engine (routing-status.timer
+	# writes it every minute). Same bearer token as the API.
+	@status {
+		header Authorization "Bearer {$MOTIS_TOKEN}"
+		path /_status
+	}
+	handle @status {
+		header Cache-Control "no-store"
+		root * /srv/motis/public
+		rewrite * /status.json
+		file_server
+	}
+
+	# Unauthenticated liveness for the external watchdog: MOTIS health only,
+	# 200 when the active dataset serves, 503 before the first dataset.
+	@healthz path /healthz
+	handle @healthz {
+		rewrite * /api/v1/health
+		import /etc/caddy/motis-upstream.caddy
+	}
 	handle {
 		respond 401
 	}

@@ -1,0 +1,9 @@
+[Unit]
+Description=Write the BusTrack routing node monitoring snapshot
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/motis-update
+ExecStart=/usr/bin/python3 -I /srv/motis/motis_update.py report
+TimeoutStartSec=2min
+Nice=10

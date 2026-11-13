@@ -13,6 +13,7 @@ Standard library only, so the node needs nothing beyond python3, zstd and tar.
     motis_update.py update [--channel production|beta] [--force] [--strategy auto|bluegreen|stop-first]
     motis_update.py rollback
     motis_update.py status
+    motis_update.py report     # writes the monitoring snapshot (routing-status.timer)
 """
 
 from __future__ import annotations
@@ -45,6 +46,13 @@ USER_AGENT = "bustrack-routing-updater/1"
 # side (serving RSS was 180-490 MB in the spike), so the old one stops first.
 BLUEGREEN_MIN_AVAILABLE_KB = 700 * 1024
 SERVICE_USER = "motis"
+# Monitoring snapshot served by Caddy at /_status (bearer token). It carries
+# host health and updater state, never a secret.
+STATUS_SCHEMA = 1
+APT_CHECK = Path("/usr/lib/update-notifier/apt-check")
+REBOOT_REQUIRED = Path("/var/run/reboot-required")
+# apt-check is slow (a few seconds); its result is cached this long.
+UPDATES_CACHE_SECONDS = 3600
 
 
 @dataclass(frozen=True)
@@ -69,6 +77,18 @@ class Paths:
 
     def env_file(self, colour: str) -> Path:
         return self.root / f"{colour}.env"
+
+    @property
+    def public(self) -> Path:
+        return self.root / "public"
+
+    @property
+    def status_file(self) -> Path:
+        return self.public / "status.json"
+
+    @property
+    def updates_cache(self) -> Path:
+        return self.root / "updates-cache.json"
 
 
 # ---------------------------------------------------------------- pure logic
@@ -182,6 +202,111 @@ def safe_members(archive: tarfile.TarFile) -> list[tarfile.TarInfo]:
             raise ValueError(f"unsupported entry type: {name}")
         members.append(member)
     return members
+
+
+def parse_meminfo_all(text: str) -> dict[str, int]:
+    """/proc/meminfo -> {key: kB} for the fields the monitor reports."""
+    wanted = {"MemTotal": "total_kb", "MemAvailable": "available_kb", "SwapTotal": "swap_total_kb", "SwapFree": "swap_free_kb"}
+    out: dict[str, int] = {}
+    for line in text.splitlines():
+        key, _, rest = line.partition(":")
+        if key in wanted and rest.split():
+            out[wanted[key]] = int(rest.split()[0])
+    return out
+
+
+def parse_apt_check(text: str) -> tuple[int, int] | None:
+    """apt-check prints '<upgrades>;<security upgrades>' on stderr."""
+    parts = text.strip().split(";")
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        return None
+    return int(parts[0]), int(parts[1])
+
+
+def parse_systemctl_show(text: str) -> dict:
+    """`systemctl show -p ActiveState,NRestarts,Result,MemoryCurrent` -> dict."""
+    raw = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    unit: dict = {
+        "active_state": raw.get("ActiveState") or None,
+        "result": raw.get("Result") or None,
+        "n_restarts": int(raw["NRestarts"]) if raw.get("NRestarts", "").isdigit() else None,
+        "memory_bytes": int(raw["MemoryCurrent"]) if raw.get("MemoryCurrent", "").isdigit() else None,
+    }
+    return unit
+
+
+def classify_error(error: BaseException) -> str:
+    """Coarse cause of a failed update run, for alerting only: `upstream` when
+    GitHub (release metadata or download) failed, `node` otherwise."""
+    if isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError)):
+        return "upstream"
+    return "node"
+
+
+def record_run(state: dict, now: datetime, error: BaseException | None) -> dict:
+    """Book-keep one `update` run in the state the monitor reports."""
+    stamp = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state = dict(state)
+    state["last_check_at"] = stamp
+    if error is None:
+        state["last_success_at"] = stamp
+        state["consecutive_failures"] = 0
+        state.pop("last_error_kind", None)
+    else:
+        state["consecutive_failures"] = int(state.get("consecutive_failures") or 0) + 1
+        state["last_error_kind"] = classify_error(error)
+    return state
+
+
+def build_status(
+    now: datetime,
+    state: dict,
+    channel: str,
+    boot_id: str | None,
+    uptime_seconds: float | None,
+    meminfo: dict[str, int],
+    disk: tuple[int, int] | None,
+    load1: float | None,
+    reboot_required_since: datetime | None,
+    updates: dict | None,
+    unit: dict | None,
+) -> dict:
+    """The monitoring snapshot. Pure: every input is passed in."""
+    def iso(value: datetime | None) -> str | None:
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if value else None
+
+    booted_at = now.replace(microsecond=0) - timedelta(seconds=round(uptime_seconds)) if uptime_seconds is not None else None
+    return {
+        "v": STATUS_SCHEMA,
+        "generated_at": iso(now),
+        "host": {
+            "boot_id": boot_id,
+            "booted_at": iso(booted_at),
+            "uptime_s": int(uptime_seconds) if uptime_seconds is not None else None,
+            "load1": load1,
+            "memory": meminfo or None,
+            "disk": {"total_bytes": disk[0], "free_bytes": disk[1]} if disk else None,
+            "reboot_required": reboot_required_since is not None,
+            "reboot_required_since": iso(reboot_required_since),
+            "updates": updates,
+        },
+        "motis": {
+            "channel": channel,
+            "active_release": state.get("active_release"),
+            "active_colour": state.get("active_colour"),
+            "active_built_at": state.get("active_built_at"),
+            "activated_at": state.get("activated_at"),
+            "activated_by": state.get("activated_by"),
+            "previous_release": state.get("previous_release"),
+            "unit": unit,
+        },
+        "updater": {
+            "last_check_at": state.get("last_check_at"),
+            "last_success_at": state.get("last_success_at"),
+            "consecutive_failures": int(state.get("consecutive_failures") or 0),
+            "last_error_kind": state.get("last_error_kind"),
+        },
+    }
 
 
 # ----------------------------------------------------------------- side effects
@@ -346,7 +471,7 @@ def switch_caddy(caddy_snippet: Path, port: int) -> None:
     systemctl("reload", "caddy")
 
 
-def activate(paths: Paths, caddy_snippet: Path, rid: str, info: dict, strategy: str, state: dict) -> None:
+def activate(paths: Paths, caddy_snippet: Path, rid: str, info: dict, strategy: str, state: dict, activated_by: str = "update") -> None:
     active_colour = state.get("active_colour")
     candidate = other_colour(active_colour)
     port = COLOURS[candidate]
@@ -380,6 +505,7 @@ def activate(paths: Paths, caddy_snippet: Path, rid: str, info: dict, strategy: 
         "active_colour": candidate,
         "active_built_at": info.get("built_at"),
         "activated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "activated_by": activated_by,
     })
     save_state(paths, state)
     existing = [p.name for p in paths.releases.iterdir() if p.is_dir() and not p.name.startswith(".")]
@@ -399,11 +525,16 @@ def cmd_update(args: argparse.Namespace, paths: Paths) -> int:
     paths.releases.mkdir(parents=True, exist_ok=True)
     paths.binaries.mkdir(parents=True, exist_ok=True)
     state = load_state(paths)
-    fetched = fetch_dataset(paths, args.channel, args.force, state)
-    if fetched is None:
-        return 0
-    rid, info = fetched
-    activate(paths, args.caddy_snippet, rid, info, args.strategy, state)
+    try:
+        fetched = fetch_dataset(paths, args.channel, args.force, state)
+        if fetched is not None:
+            rid, info = fetched
+            activate(paths, args.caddy_snippet, rid, info, args.strategy, state)
+    except Exception as error:
+        # Book-keep the failure for the monitor, then let main() log it.
+        save_state(paths, record_run(load_state(paths), datetime.now(timezone.utc), error))
+        raise
+    save_state(paths, record_run(load_state(paths), datetime.now(timezone.utc), None))
     return 0
 
 
@@ -414,12 +545,95 @@ def cmd_rollback(args: argparse.Namespace, paths: Paths) -> int:
         log("no previous release on disk")
         return 1
     info = json.loads((paths.releases / previous / "data" / "build-info.json").read_text(encoding="utf-8"))
-    activate(paths, args.caddy_snippet, previous, info, args.strategy, state)
+    activate(paths, args.caddy_snippet, previous, info, args.strategy, state, activated_by="rollback")
     return 0
 
 
 def cmd_status(args: argparse.Namespace, paths: Paths) -> int:
     print(json.dumps(load_state(paths), indent=2))
+    return 0
+
+
+def _read(path: str) -> str | None:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def read_updates(paths: Paths, now: datetime) -> dict | None:
+    """Pending package upgrades via apt-check, cached for an hour."""
+    try:
+        cached = json.loads(paths.updates_cache.read_text(encoding="utf-8"))
+        checked = datetime.fromisoformat(cached["checked_at"].replace("Z", "+00:00"))
+        if (now - checked).total_seconds() < UPDATES_CACHE_SECONDS:
+            return cached
+    except (OSError, ValueError, KeyError):
+        pass
+    if not APT_CHECK.is_file():
+        return None
+    try:
+        result = subprocess.run([str(APT_CHECK)], capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    parsed = parse_apt_check(result.stderr)
+    if parsed is None:
+        return None
+    value = {"checked_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "pending": parsed[0], "security": parsed[1]}
+    try:
+        paths.updates_cache.write_text(json.dumps(value) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return value
+
+
+def read_unit(colour: str | None) -> dict | None:
+    if not colour:
+        return None
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", f"motis@{colour}", "-p", "ActiveState,NRestarts,Result,MemoryCurrent"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_systemctl_show(result.stdout)
+
+
+def cmd_report(args: argparse.Namespace, paths: Paths) -> int:
+    """Write the monitoring snapshot. Every probe is best effort: a missing
+    value is null, never a failed run."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    state = load_state(paths)
+    uptime_text = _read("/proc/uptime")
+    loadavg = _read("/proc/loadavg")
+    try:
+        usage = shutil.disk_usage("/")
+        disk = (usage.total, usage.free)
+    except OSError:
+        disk = None
+    try:
+        reboot_since = datetime.fromtimestamp(REBOOT_REQUIRED.stat().st_mtime, timezone.utc)
+    except OSError:
+        reboot_since = None
+    snapshot = build_status(
+        now=now,
+        state=state,
+        channel=args.channel,
+        boot_id=(_read("/proc/sys/kernel/random/boot_id") or "").strip() or None,
+        uptime_seconds=float(uptime_text.split()[0]) if uptime_text else None,
+        meminfo=parse_meminfo_all(_read("/proc/meminfo") or ""),
+        disk=disk,
+        load1=float(loadavg.split()[0]) if loadavg else None,
+        reboot_required_since=reboot_since,
+        updates=read_updates(paths, now),
+        unit=read_unit(state.get("active_colour")),
+    )
+    paths.public.mkdir(parents=True, exist_ok=True)
+    tmp = paths.status_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(snapshot, separators=(",", ":")) + "\n", encoding="utf-8")
+    tmp.chmod(0o644)
+    tmp.replace(paths.status_file)
     return 0
 
 
@@ -435,6 +649,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_update.set_defaults(func=cmd_update)
     sub.add_parser("rollback").set_defaults(func=cmd_rollback)
     sub.add_parser("status").set_defaults(func=cmd_status)
+    p_report = sub.add_parser("report")
+    p_report.add_argument("--channel", choices=sorted(CHANNEL_TAGS), default=os.environ.get("MOTIS_CHANNEL", "production"))
+    p_report.set_defaults(func=cmd_report)
     return parser.parse_args(argv)
 
 
