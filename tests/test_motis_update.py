@@ -41,6 +41,18 @@ class MotisUpdateTests(unittest.TestCase):
         # Everything outside the server block is untouched.
         self.assertEqual(rendered.split("osm:", 1)[1], rewritten.split("osm:", 1)[1])
 
+    def test_port_rewrite_sets_web_folder_once(self) -> None:
+        rendered = motis_build.render_motis_config(motis_build.load_routing_config())
+        ui = Path("/srv/motis/bin/2.11.4/ui")
+        once = motis_update.set_server_port(rendered, 8081, ui)
+        self.assertIn('  port: 8081\n  web_folder: "/srv/motis/bin/2.11.4/ui"\n', once)
+        # Re-activating the same release (rollback) must not duplicate the key.
+        twice = motis_update.set_server_port(once, 8082, ui)
+        self.assertEqual(twice.count("web_folder:"), 1)
+        self.assertIn("  port: 8082\n", twice)
+        # Without a UI folder an existing line is kept untouched.
+        self.assertEqual(motis_update.set_server_port(once, 8081).count("web_folder:"), 1)
+
     def test_port_rewrite_requires_server_port(self) -> None:
         with self.assertRaises(ValueError):
             motis_update.set_server_port("osm: x\n", 8081)

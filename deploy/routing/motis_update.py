@@ -110,9 +110,11 @@ def release_id(data_sha256: str) -> str:
     return data_sha256[:16]
 
 
-def set_server_port(config_text: str, port: int) -> str:
+def set_server_port(config_text: str, port: int, web_folder: Path | None = None) -> str:
     """Rewrite `server.port` (and pin the host to loopback) in the config.yml
-    rendered by scripts/motis_build.py."""
+    rendered by scripts/motis_build.py. With `web_folder`, also point MOTIS at
+    the debug web UI shipped in the release archive (served behind Caddy's
+    basic auth only); without it, any existing `web_folder` line is kept."""
     lines = config_text.splitlines()
     out: list[str] = []
     in_server = False
@@ -120,9 +122,15 @@ def set_server_port(config_text: str, port: int) -> str:
     for line in lines:
         if line and not line.startswith((" ", "\t")):
             in_server = line.rstrip() == "server:"
+        if in_server and web_folder is not None and line.strip().startswith("web_folder:"):
+            continue
         if in_server and line.strip().startswith("port:"):
             line = f"  port: {port}"
             seen_port = True
+            out.append(line)
+            if web_folder is not None:
+                out.append(f"  web_folder: {json.dumps(str(web_folder))}")
+            continue
         elif in_server and line.strip().startswith("host:"):
             line = "  host: 127.0.0.1"
         out.append(line)
@@ -477,8 +485,10 @@ def activate(paths: Paths, caddy_snippet: Path, rid: str, info: dict, strategy: 
     port = COLOURS[candidate]
     data_dir = paths.releases / rid / "data"
     config_path = data_dir / "config.yml"
-    config_path.write_text(set_server_port(config_path.read_text(encoding="utf-8"), port), encoding="utf-8")
     binary = ensure_binary(paths, info["motis_version"], info.get("motis_sha256", ""))
+    ui_dir = binary.parent / "ui"
+    web_folder = ui_dir if (ui_dir / "index.html").is_file() else None
+    config_path.write_text(set_server_port(config_path.read_text(encoding="utf-8"), port, web_folder), encoding="utf-8")
     write_env(paths, candidate, binary, data_dir)
     chosen = choose_strategy(strategy, read_mem_available(), bool(active_colour))
     log(f"activating {rid} on {candidate}:{port} ({chosen})")
