@@ -1,5 +1,6 @@
 # Routing node. ROUTING_HOST and MOTIS_TOKEN come from /etc/caddy/motis.env
-# (systemd drop-in, see install.sh). Only the BusTrack backend calls this host.
+# (systemd drop-in, see install.sh). The BusTrack backend calls /api/* with the
+# bearer token; the owner can open the MOTIS web UI with basic auth.
 {
 	admin localhost:2019
 }
@@ -35,8 +36,16 @@
 		rewrite * /api/v1/health
 		import /etc/caddy/motis-upstream.caddy
 	}
+	# MOTIS debug web UI for the owner only: HTTP basic auth with the
+	# credentials install.sh generated (/etc/caddy/routing-ui.caddy). It also
+	# covers the UI's own /api and /tiles calls; the upstream snippet strips
+	# the Authorization header before MOTIS sees it. Everything unauthenticated
+	# still gets 401.
 	handle {
-		respond 401
+		import /etc/caddy/routing-ui.caddy
+		header X-Robots-Tag "noindex, nofollow"
+		header Cache-Control "private, no-store"
+		import /etc/caddy/motis-upstream.caddy
 	}
 
 	log {
