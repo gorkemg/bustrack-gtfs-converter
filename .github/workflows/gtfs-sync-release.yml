@@ -33,12 +33,12 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -55,7 +55,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -87,12 +87,12 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -103,7 +103,7 @@ jobs:
 
       - name: Restore External Resource Cache
         if: matrix.agency == 'pvta'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: internal/assets/cache/pvta_routedetails_https_v2.json
           key: external-resource-https-v2-${{ matrix.agency }}-${{ env.EXTERNAL_CACHE_PERIOD }}
@@ -181,7 +181,7 @@ jobs:
 
       - name: Create Archive Release
         if: env.RELEASE_CHANNEL == 'production' && steps.check_file.outputs.created == 'true'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: ${{ matrix.agency }}-${{ steps.timestamp.outputs.value }}
           name: ${{ matrix.agency }} Archive ${{ steps.timestamp.outputs.value }}
@@ -197,7 +197,7 @@ jobs:
 
       - name: Create or Update Previous Release
         if: steps.previous_asset.outputs.available == 'true'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: ${{ matrix.agency }}-previous
           name: ${{ matrix.agency }} Previous ${{ steps.timestamp.outputs.value }}
@@ -214,7 +214,7 @@ jobs:
 
       - name: Create or Update Production Release
         if: env.RELEASE_CHANNEL == 'production' && steps.check_file.outputs.created == 'true'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: ${{ matrix.agency }}
           name: ${{ matrix.agency }} Production ${{ steps.timestamp.outputs.value }}
@@ -230,7 +230,7 @@ jobs:
 
       - name: Create or Update Beta Prerelease
         if: env.RELEASE_CHANNEL == 'beta' && steps.check_file.outputs.created == 'true'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: ${{ matrix.agency }}-prerelease
           name: ${{ matrix.agency }} Prerelease ${{ steps.timestamp.outputs.value }}
