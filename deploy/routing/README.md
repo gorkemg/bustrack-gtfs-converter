@@ -19,6 +19,7 @@ motis_update.py ── verify sha256 ── extract to /srv/motis/releases/<id>
 | `/srv/motis/bin/<version>/motis` | MOTIS binary per version named in `build-info.json` |
 | `/srv/motis/state.json` | active/previous release and colour |
 | `/etc/caddy/motis.env` | `ROUTING_HOST`, `MOTIS_TOKEN` (root:caddy 0640) |
+| `/etc/caddy/routing-ui.caddy` | basic-auth user and bcrypt hash for the web UI (root:caddy 0640) |
 | `/etc/default/motis-update` | `MOTIS_CHANNEL=production` or `beta`, optional `GITHUB_TOKEN` |
 | `/srv/motis/public/status.json` | monitoring snapshot, rewritten every minute by `routing-status.timer` |
 
@@ -41,6 +42,12 @@ Swap strategy: with at least 700 MB available, the new colour starts beside the 
 
 Capacity: serving RSS was 180 to 490 MB for PVTA + UTA in the spike. Each additional city adds roughly its GTFS plus clipped OSM size; watch `systemctl status motis@<colour>` and raise `MemoryMax` together with the node size.
 
+## Web UI (owner only)
+
+`https://<dns name>/` serves the MOTIS debug web UI (search, plan, itinerary on a map) behind HTTP basic auth. It is a tool for checking the dataset, not a rider product, and the apps never use it. `install.sh` generates the credentials once (user `admin`, or `ROUTING_UI_USER=<name>` on the first run) and prints the password a single time; only its bcrypt hash stays on the node. To rotate, delete `/etc/caddy/routing-ui.caddy` and re-run `install.sh`.
+
+The updater points MOTIS at the `ui/` folder of the release archive (`server.web_folder`) on every activation, so after upgrading an existing node run `motis_update.py update --force` once. The dataset carries no map tiles, so the UI may show routes on a plain background. Each failed login costs a bcrypt check on the single vCPU; keep the password long and the URL private.
+
 ## Monitoring
 
 The backend's alert engine watches this node (checks `routing.*`, see the backend README). The node only publishes data, it never pushes anything itself.
@@ -49,6 +56,7 @@ The backend's alert engine watches this node (checks `routing.*`, see the backen
 | :--- | :--- | :--- |
 | `/_status` | bearer token | `status.json`: boot id and time, memory, disk, load, pending (security) updates, `reboot-required`, active release and colour, `motis@<colour>` state, restarts and last result, updater success/failure counters |
 | `/healthz` | none | MOTIS `/api/v1/health` of the active colour, for the external watchdog |
+| everything else | basic auth | MOTIS web UI and its API calls (see above); 401 without credentials |
 
 `motis_update.py report` writes the snapshot; every probe is best effort, a missing value is `null`. Pending updates come from `apt-check`, cached for an hour.
 

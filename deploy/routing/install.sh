@@ -58,6 +58,20 @@ else
   sed -i "s/^ROUTING_HOST=.*/ROUTING_HOST=$ROUTING_HOST/" /etc/caddy/motis.env
 fi
 chown root:caddy /etc/caddy/motis.env && chmod 0640 /etc/caddy/motis.env
+# Basic-auth credentials for the MOTIS debug web UI (owner only). Generated
+# once; the password is printed a single time and only its bcrypt hash stays
+# on the node. Delete /etc/caddy/routing-ui.caddy and re-run to rotate.
+ROUTING_UI_USER="${ROUTING_UI_USER:-admin}"
+if [[ ! -f /etc/caddy/routing-ui.caddy ]]; then
+  [[ "$ROUTING_UI_USER" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "ROUTING_UI_USER may only contain letters, digits, . _ -" >&2; exit 1; }
+  ui_password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+  ui_hash="$(caddy hash-password --plaintext "$ui_password")"
+  printf 'basic_auth {\n\t%s %s\n}\n' "$ROUTING_UI_USER" "$ui_hash" > /etc/caddy/routing-ui.caddy
+  echo "Routing web UI https://$ROUTING_HOST/ - user $ROUTING_UI_USER, password (store it now; it is not shown again):"
+  echo "$ui_password"
+  unset ui_password ui_hash
+fi
+chown root:caddy /etc/caddy/routing-ui.caddy && chmod 0640 /etc/caddy/routing-ui.caddy
 grep -q '^MOTIS_TOKEN=.\{32,\}$' /etc/caddy/motis.env || { echo "MOTIS_TOKEN in /etc/caddy/motis.env is missing or too short" >&2; exit 1; }
 printf 'MOTIS_CHANNEL=%s\n' "$MOTIS_CHANNEL" > /etc/default/motis-update
 umask 022
