@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import logging
 import math
@@ -607,6 +608,72 @@ def zip_sqlite_file(sqlite_path: Path) -> Path:
 
     LOGGER.info("Created SQLite archive: %s", zip_path)
     return zip_path
+
+
+GTFS_TIME_COLUMNS = frozenset({"arrival_time", "departure_time", "start_time", "end_time"})
+GTFS_TIME_PATTERN = re.compile(r"^(\d{1,3}):([0-5]\d):([0-5]\d)$")
+
+
+def normalize_gtfs_time(value: str) -> str:
+    """Return a GTFS time as HH:MM:SS without surrounding whitespace.
+
+    Some feeds (UTA) pad hours with a leading space (" 4:15:00"). Strict GTFS
+    consumers such as MOTIS misparse those, so the exported feed is canonical.
+    Values that are not times are returned stripped but otherwise unchanged.
+    """
+    stripped = value.strip()
+    match = GTFS_TIME_PATTERN.fullmatch(stripped)
+    if not match:
+        return stripped
+    hours, minutes, seconds = match.groups()
+    return f"{int(hours):02d}:{minutes}:{seconds}"
+
+
+def normalize_gtfs_row(columns: list[str], row: list[str]) -> tuple[list[str], int]:
+    normalized: list[str] = []
+    changed = 0
+    for column_name, raw_value in zip(columns, row):
+        if column_name in GTFS_TIME_COLUMNS:
+            value = normalize_gtfs_time(raw_value)
+        else:
+            value = raw_value.strip()
+        if value != raw_value:
+            changed += 1
+        normalized.append(value)
+    return normalized, changed
+
+
+def write_normalized_gtfs_zip(gtfs_files: list[Path], zip_path: Path) -> int:
+    """Write the feed as a normalized GTFS ZIP for routing engines.
+
+    Every field is stripped and time columns are zero padded. Returns the
+    number of changed cells so the log shows how much the source deviated.
+    """
+    changed_cells = 0
+    temp_path = zip_path.with_name(f".{zip_path.name}.tmp")
+    temp_path.unlink(missing_ok=True)
+    with zipfile.ZipFile(temp_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for gtfs_file in gtfs_files:
+            columns = [column.strip() for column in read_gtfs_header(gtfs_file)]
+            with gtfs_file.open("r", encoding="utf-8-sig", newline="") as source, archive.open(
+                gtfs_file.name, mode="w"
+            ) as raw_target:
+                reader = csv.reader(source)
+                next(reader, None)
+                with io.TextIOWrapper(raw_target, encoding="utf-8", newline="") as target:
+                    writer = csv.writer(target, lineterminator="\n")
+                    writer.writerow(columns)
+                    for row_number, row in enumerate(reader, start=2):
+                        if len(row) != len(columns):
+                            raise ValueError(
+                                f"Row {row_number} in {gtfs_file} has {len(row)} values; expected {len(columns)}"
+                            )
+                        normalized, changed = normalize_gtfs_row(columns, row)
+                        changed_cells += changed
+                        writer.writerow(normalized)
+    temp_path.replace(zip_path)
+    LOGGER.info("Created normalized GTFS archive: %s (%d cells normalized)", zip_path, changed_cells)
+    return changed_cells
 
 
 def cleanup_extracted_folder(target_dir: Path) -> None:
@@ -2306,6 +2373,13 @@ def main() -> int:
         zip_path = zip_sqlite_file(output_path)
     except (OSError, ValueError, zipfile.BadZipFile) as error:
         LOGGER.error("Failed to create SQLite archive: %s", error)
+        return 1
+
+    gtfs_zip_path = output_path.with_suffix(".gtfs.zip")
+    try:
+        write_normalized_gtfs_zip(gtfs_files, gtfs_zip_path)
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        LOGGER.error("Failed to create normalized GTFS archive: %s", error)
         return 1
 
     if args.agency:

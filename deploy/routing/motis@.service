@@ -1,0 +1,33 @@
+# MOTIS routing server, one instance per colour (blue :8081, green :8082).
+# /srv/motis/<colour>.env is written by motis_update.py.
+[Unit]
+Description=MOTIS routing server (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=motis
+Group=motis
+EnvironmentFile=/srv/motis/%i.env
+ExecStart=/bin/sh -c 'exec "$MOTIS_BIN" server -d "$MOTIS_DATA"'
+Restart=on-failure
+RestartSec=5
+# Serving RSS was 180-490 MB in the spike; the cap keeps a runaway process
+# from taking the node down. Raise it together with the node size.
+MemoryMax=800M
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/motis/releases
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

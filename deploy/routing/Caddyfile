@@ -1,0 +1,49 @@
+# Routing node. ROUTING_HOST and MOTIS_TOKEN come from /etc/caddy/motis.env
+# (systemd drop-in, see install.sh). Only the BusTrack backend calls this host.
+{
+	admin localhost:2019
+}
+
+{$ROUTING_HOST} {
+	encode zstd gzip
+
+	@authorized {
+		header Authorization "Bearer {$MOTIS_TOKEN}"
+		path /api/*
+	}
+	handle @authorized {
+		import /etc/caddy/motis-upstream.caddy
+	}
+
+	# Monitoring snapshot for the backend's alert engine (routing-status.timer
+	# writes it every minute). Same bearer token as the API.
+	@status {
+		header Authorization "Bearer {$MOTIS_TOKEN}"
+		path /_status
+	}
+	handle @status {
+		header Cache-Control "no-store"
+		root * /srv/motis/public
+		rewrite * /status.json
+		file_server
+	}
+
+	# Unauthenticated liveness for the external watchdog: MOTIS health only,
+	# 200 when the active dataset serves, 503 before the first dataset.
+	@healthz path /healthz
+	handle @healthz {
+		rewrite * /api/v1/health
+		import /etc/caddy/motis-upstream.caddy
+	}
+	handle {
+		respond 401
+	}
+
+	log {
+		output file /var/log/caddy/routing.log {
+			roll_size 20MiB
+			roll_keep 5
+		}
+		format json
+	}
+}

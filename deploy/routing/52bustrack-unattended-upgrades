@@ -1,0 +1,7 @@
+// BusTrack routing node: security updates install automatically and a
+// required reboot happens at 09:00 UTC (04:00 US Eastern, the quietest hour
+// for PVTA and UTA). The backend classifies a boot in 09:00-09:20 UTC after
+// /var/run/reboot-required as planned (🔄), any other boot as unplanned.
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+Unattended-Upgrade::Automatic-Reboot-Time "09:00";

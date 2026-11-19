@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the BusTrack routing node monitoring snapshot every minute
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
