@@ -56,6 +56,16 @@ class MotisBuildTests(unittest.TestCase):
         self.assertEqual((when.weekday(), when.hour, when.minute), (0, 8, 0))
         self.assertEqual(when.date().isoformat(), "2026-11-16")
 
+    def test_weekday_mornings_probe_past_holidays_and_weekends(self) -> None:
+        # Wednesday before Thanksgiving: Thu (holiday, no UTA service), Fri, Mon.
+        wednesday_utc = datetime(2026, 11, 25, 9, 15, tzinfo=timezone.utc)
+        mornings = motis_build.weekday_mornings("America/Denver", wednesday_utc)
+        self.assertEqual(
+            [m.date().isoformat() for m in mornings],
+            ["2026-11-26", "2026-11-27", "2026-11-30"],
+        )
+        self.assertTrue(all(m.hour == 8 and m.minute == 0 for m in mornings))
+
     def test_plan_url_uses_utc_time(self) -> None:
         when = datetime(2026, 11, 16, 8, 0, tzinfo=motis_build.ZoneInfo("America/Denver"))
         url = motis_build.plan_url("http://127.0.0.1:8080/", [40.7, -111.8], [40.8, -111.9], when)
