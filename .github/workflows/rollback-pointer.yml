@@ -1,0 +1,75 @@
+name: Roll back production pointer
+
+# Resets the `production` code pointer to an earlier deploy tag (prod-*), the only allowed non-fast-forward move
+# (overview/git-branching-model.md §3.1). Owner only. Afterwards fix forward on main and promote again.
+# Published release assets are not touched: restore those with Manual Rollback (rollback.yml).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Deploy tag to roll back to (prod-YYYYMMDD-HHMM)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-pointers
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - name: Require dispatch from main by the owner
+        env:
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Run this workflow from main (got $GITHUB_REF)" >&2
+            exit 1
+          fi
+          if [ "$TRIGGERING_ACTOR" != "gorkemg" ]; then
+            echo "Only the owner may move production (triggered by $TRIGGERING_ACTOR)" >&2
+            exit 1
+          fi
+      - name: Require the promote deploy key
+        env:
+          PROMOTE_SSH_KEY: ${{ secrets.PROMOTE_SSH_KEY }}
+        run: |
+          if [ -z "$PROMOTE_SSH_KEY" ]; then
+            echo "Environment secret PROMOTE_SSH_KEY is missing in environment production" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          ssh-key: ${{ secrets.PROMOTE_SSH_KEY }}
+      - name: Reset production to the tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^prod-[0-9]{8}-[0-9]{4}([0-9]{2})?$ ]]; then
+            echo "tag must look like prod-YYYYMMDD-HHMM" >&2
+            exit 1
+          fi
+          git fetch --tags origin
+          sha="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "$TAG ($sha) is not on main" >&2
+            exit 1
+          fi
+          git push --force origin "$sha:refs/heads/production"
+          {
+            echo "### Rolled back production"
+            echo "- tag: \`$TAG\`"
+            echo "- commit: \`$sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"

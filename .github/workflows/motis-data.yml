@@ -4,6 +4,7 @@ name: MOTIS Routing Data
 # agencies in config/routing.json and publishes it as a release asset. The
 # routing server only downloads and swaps this package; it never imports.
 #
+# Code is checked out from the `production` / `staging` pointer, never from `main`.
 # Inputs: the normalized {agency}.gtfs.zip assets of the converter releases
 # ({agency} for production, {agency}-prerelease for beta) and Geofabrik OSM
 # extracts clipped to each agency's bounding box.
@@ -14,7 +15,9 @@ on:
   workflow_run:
     workflows: ["GTFS Sync & Release"]
     types: [completed]
-    branches: [main]
+    # Push runs carry head branch `production`; cron and dispatch runs carry the default branch. Both build
+    # production from the production GTFS releases. Beta MOTIS is built by gtfs-staging-prerelease.yml.
+    branches: [production, main]
   schedule:
     # Weekly refresh of the OSM street network and the MOTIS timetable window.
     - cron: '40 5 * * 1'
@@ -52,6 +55,8 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          # Pointer code only: production for the production channel, staging for beta.
+          ref: ${{ (inputs.channel || 'production') == 'beta' && 'staging' || 'production' }}
           persist-credentials: false
 
       - name: Set up Python

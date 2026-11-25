@@ -26,8 +26,8 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
-  beta-security-check:
-    # GitHub schedules execute from the default branch. Explicitly test beta.
+  staging-security-check:
+    # GitHub schedules execute from the default branch. Explicitly test the staging pointer.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -36,10 +36,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: beta
+          ref: staging
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
-      - name: Test beta
+      - name: Test staging
         run: python -m unittest discover -s tests -v
