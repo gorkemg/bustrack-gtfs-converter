@@ -110,6 +110,20 @@ def next_weekday_morning(tz_name: str, now: datetime) -> datetime:
     return candidate
 
 
+# Agencies run no or reduced service on public holidays (UTA has none on
+# Thanksgiving), so a single probe day makes the smoke test fail on a correct
+# package. Probe several consecutive weekday mornings and fail only if none
+# of them yields a transit leg of the agency's dataset.
+SMOKE_PROBE_DAYS = 3
+
+
+def weekday_mornings(tz_name: str, now: datetime, count: int = SMOKE_PROBE_DAYS) -> list[datetime]:
+    mornings = [next_weekday_morning(tz_name, now)]
+    while len(mornings) < count:
+        mornings.append(next_weekday_morning(tz_name, mornings[-1]))
+    return mornings
+
+
 def plan_url(base_url: str, origin: list[float], destination: list[float], when: datetime) -> str:
     query = urllib.parse.urlencode({
         "fromPlace": f"{origin[0]},{origin[1]}",
@@ -204,15 +218,20 @@ def cmd_smoke(args: argparse.Namespace) -> int:
         trip = agency.get("smoke_trip")
         if not trip:
             continue
-        when = next_weekday_morning(agency["timezone"], now)
-        url = plan_url(args.base_url, trip["from"], trip["to"], when)
-        with urllib.request.urlopen(url, timeout=60) as response:
-            plan = json.load(response)
-        error = smoke_check(plan, agency["id"])
-        if error:
-            failures.append(error)
+        errors = []
+        for when in weekday_mornings(agency["timezone"], now):
+            url = plan_url(args.base_url, trip["from"], trip["to"], when)
+            with urllib.request.urlopen(url, timeout=60) as response:
+                plan = json.load(response)
+            error = smoke_check(plan, agency["id"])
+            if error is None:
+                print(f"{agency['id']}: ok on {when.date().isoformat()} "
+                      f"({len(plan.get('itineraries', []))} itineraries)")
+                break
+            errors.append(f"{when.date().isoformat()}: {error}")
+            print(f"{agency['id']}: no service on {when.date().isoformat()}, trying next weekday")
         else:
-            print(f"{agency['id']}: ok ({len(plan.get('itineraries', []))} itineraries)")
+            failures.append(f"{agency['id']}: failed on all {len(errors)} probe days: " + "; ".join(errors))
     for failure in failures:
         print(failure, file=sys.stderr)
     return 1 if failures else 0
