@@ -1,27 +1,44 @@
 name: GTFS Sync & Release
 
+# Publishes from the deploy pointers only (overview/git-branching-model.md): code is always checked out from
+# `production` (channel production) or `staging` (channel beta), never from `main`. `main` is integration only.
+#   - push to `production` touching config/agencies.json, the cron and manual dispatches -> production tiers
+#   - gtfs-staging-prerelease.yml (push to `staging`) calls this with channel beta -> {agency}-prerelease
+# Cron and dispatch runs use the workflow definition from the default branch, but check out pointer code.
+
 on:
   push:
     branches:
-      - main
+      - production
     paths:
       - config/agencies.json
   schedule:
     - cron: '15 4 * * 0,3,5'
   workflow_dispatch:
     inputs:
+      channel:
+        description: 'Release channel (production builds from the production branch, beta from staging)'
+        type: choice
+        options: [production, beta]
+        default: production
       force_update:
         description: 'Force update even if no new GTFS data is detected'
         type: boolean
         default: false
 
   workflow_call:
+    inputs:
+      channel:
+        type: string
+        required: true
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  RELEASE_CHANNEL: ${{ inputs.channel || 'production' }}
+  SOURCE_REF: ${{ inputs.channel == 'beta' && 'staging' || 'production' }}
 
 concurrency:
-  group: gtfs-sync-release-${{ github.ref }}
+  group: gtfs-sync-release-${{ inputs.channel || 'production' }}
   cancel-in-progress: false
 
 jobs:
@@ -35,6 +52,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.SOURCE_REF }}
           persist-credentials: false
 
       - name: Set up Python
@@ -57,6 +75,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.SOURCE_REF }}
           persist-credentials: false
 
       - name: Build Agency Matrix
@@ -70,7 +89,7 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   sync:
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/beta'
+    if: contains(fromJSON('["production", "beta"]'), inputs.channel || 'production')
     needs:
       - tests
       - prepare-agencies
@@ -78,8 +97,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
-    env:
-      RELEASE_CHANNEL: ${{ github.ref == 'refs/heads/beta' && 'beta' || 'production' }}
     strategy:
       fail-fast: false
       matrix:
@@ -89,6 +106,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.SOURCE_REF }}
           persist-credentials: false
 
       - name: Set up Python
@@ -205,7 +223,7 @@ jobs:
           body: |
             Rollback release captured from the prior production asset for ${{ matrix.agency }}.
             Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            Commit: ${{ github.sha }}
+            Source: ${{ env.SOURCE_REF }}
           draft: false
           prerelease: false
           make_latest: false

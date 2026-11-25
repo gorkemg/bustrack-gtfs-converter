@@ -1,5 +1,8 @@
 name: Manual Rollback
 
+# Restores an agency's production release asset from {agency}-previous. This is the artifact rollback;
+# rollback-pointer.yml resets the `production` code pointer.
+
 on:
   workflow_dispatch:
     inputs:
@@ -28,6 +31,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: production
           persist-credentials: false
 
       - name: Validate Agency Input

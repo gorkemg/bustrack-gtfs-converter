@@ -1,0 +1,125 @@
+name: Promote
+
+# Fast-forwards a deploy pointer (overview/git-branching-model.md §3.1):
+#   staging    <- a commit on main (default: main HEAD)
+#   production <- the current staging HEAD (default; an explicit sha must equal it)
+# The push uses the PROMOTE_SSH_KEY deploy key (secret of the target environment). Unlike a GITHUB_TOKEN push it
+# triggers the pointer's push workflows and may move ranges that touch .github/workflows. Production promotions
+# are tagged prod-YYYYMMDD-HHMM and may only be started by the owner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Pointer to move'
+        type: choice
+        options: [staging, production]
+        default: staging
+      sha:
+        description: 'Commit to promote (default is main HEAD for staging, staging HEAD for production)'
+        required: false
+        type: string
+      rebuild:
+        description: 'Production only: afterwards run GTFS Sync & Release with force_update'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-pointers
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ${{ inputs.target }}
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Require dispatch from main, production only by the owner
+        env:
+          TARGET: ${{ inputs.target }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Run this workflow from main (got $GITHUB_REF)" >&2
+            exit 1
+          fi
+          if [ "$TARGET" = "production" ] && [ "$TRIGGERING_ACTOR" != "gorkemg" ]; then
+            echo "Only the owner may move production (triggered by $TRIGGERING_ACTOR)" >&2
+            exit 1
+          fi
+      - name: Require the promote deploy key
+        env:
+          PROMOTE_SSH_KEY: ${{ secrets.PROMOTE_SSH_KEY }}
+        run: |
+          if [ -z "$PROMOTE_SSH_KEY" ]; then
+            echo "Environment secret PROMOTE_SSH_KEY is missing in environment ${{ inputs.target }}" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          ssh-key: ${{ secrets.PROMOTE_SSH_KEY }}
+      - name: Fast-forward the pointer
+        env:
+          TARGET: ${{ inputs.target }}
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_SHA:-}" ] && ! [[ "$INPUT_SHA" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "sha must be a hex commit id" >&2
+            exit 1
+          fi
+          if [ "$TARGET" = "staging" ]; then
+            sha="$(git rev-parse --verify "${INPUT_SHA:-origin/main}^{commit}")"
+            if ! git merge-base --is-ancestor "$sha" origin/main; then
+              echo "$sha is not on main" >&2
+              exit 1
+            fi
+          else
+            staging="$(git rev-parse --verify origin/staging^{commit})"
+            sha="$(git rev-parse --verify "${INPUT_SHA:-$staging}^{commit}")"
+            if [ "$sha" != "$staging" ]; then
+              echo "Production may only move to the staging HEAD ($staging), not $sha" >&2
+              exit 1
+            fi
+          fi
+          if git rev-parse --verify -q "origin/$TARGET" >/dev/null; then
+            current="$(git rev-parse "origin/$TARGET")"
+            if ! git merge-base --is-ancestor "$current" "$sha"; then
+              echo "Not a fast-forward: $TARGET is at $current, which is not an ancestor of $sha" >&2
+              exit 1
+            fi
+          fi
+          git push origin "$sha:refs/heads/$TARGET"
+          {
+            echo "### Promoted $TARGET"
+            echo "- commit: \`$sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$TARGET" = "production" ]; then
+            tag="prod-$(date -u +%Y%m%d-%H%M)"
+            if git ls-remote --exit-code --tags origin "$tag" >/dev/null; then
+              tag="prod-$(date -u +%Y%m%d-%H%M%S)"
+            fi
+            git tag "$tag" "$sha"
+            git push origin "refs/tags/$tag"
+            echo "- tag: \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Rebuild artifacts from the new pointer
+        if: inputs.rebuild && inputs.target == 'production'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A push to staging already builds the prerelease; production pushes only rebuild when
+          # config/agencies.json changed, so code-only promotions need an explicit force_update.
+          channel=production
+          gh workflow run gtfs-sync-release.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f channel="$channel" -f force_update=true
+          echo "- rebuild: GTFS Sync & Release dispatched (channel $channel, force_update)" >> "$GITHUB_STEP_SUMMARY"
+

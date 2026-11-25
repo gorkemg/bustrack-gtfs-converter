@@ -24,7 +24,7 @@ To ensure zero-downtime and high reliability for mobile end-users, this reposito
 | **Production** | `{agency}` | Stable | Primary endpoint for production mobile applications. |
 | **Previous** | `{agency}-previous` | Backup | Immediate rollback point in case of data inconsistencies. |
 | **Archive** | Draft release `{agency} Archive YYYYMMDD-HHMM` (untagged) | Historical | Immutable record for audit trails and regression testing. Stored as maintainer-only draft releases so archive runs do not clutter the tags page. |
-| **Beta** | `{agency}-prerelease` | Testing | Rolling pre-release built from the `beta` branch for app-side testing. |
+| **Beta** | `{agency}-prerelease` | Testing | Rolling pre-release built from the `staging` pointer for app-side testing. |
 
 Each agency release also carries `{agency}.gtfs.zip`: the same feed as a normalized GTFS archive (every field trimmed, times zero padded to `HH:MM:SS`). Routing engines consume it; UTA's source feed has times such as `" 4:15:00"` that strict parsers misread. The manual rollback restores only the SQLite asset.
 
@@ -32,12 +32,12 @@ The repository does not rely on GitHub's global `Latest` badge. Clients are expe
 
 ### Beta Channel
 
-Every push to the `beta` branch triggers the sync workflow in beta mode (see `.github/workflows/gtfs-beta-prerelease.yml`):
+Every push to the `staging` pointer (moved by *Promote*, see [docs/release-flow.md](docs/release-flow.md)) triggers the sync workflow in beta mode (see `.github/workflows/gtfs-staging-prerelease.yml`):
 
 - The converter always runs with `--force-update`, so an artifact is produced even when the upstream GTFS feed is unchanged — the point is to test converter changes, not feed changes.
 - The result is published as a GitHub pre-release under the rolling tag `{agency}-prerelease`, with the asset name `{agency}.sqlite.zip` replaced on each run.
 - Production tags (`{agency}`, `{agency}-previous`, archive tags) are never created or modified by beta runs, so production clients remain unaffected.
-- Scheduled runs and `config/agencies.json` pushes on `main` continue to publish through the production tiers only.
+- Scheduled runs, manual production dispatches and `config/agencies.json` changes reaching the `production` pointer publish through the production tiers only, always with code checked out from `production`. Merging into `main` publishes nothing.
 
 ### Sync Cadence and Release Timing
 
@@ -129,8 +129,8 @@ An agency also needs an entry in `config/routing.json` (bounding box, Geofabrik 
 
 | Trigger | Channel | Release tag |
 | :--- | :--- | :--- |
-| `GTFS Sync & Release` finished on `main`, weekly Monday cron, manual dispatch | production | `motis` |
-| Push to `beta` (after the beta prerelease), manual dispatch | beta | `motis-prerelease` |
+| `GTFS Sync & Release` finished (production pointer, cron or dispatch), weekly Monday cron, manual dispatch | production | `motis` |
+| Push to `staging` (after the beta prerelease), manual dispatch | beta | `motis-prerelease` |
 
 Steps: download `{agency}.gtfs.zip` from the agency releases, clip Geofabrik OSM extracts to each `bbox` with osmium and merge them, run `motis import` with the pinned version from `config/routing.json`, then serve the packaged `data/` from a fresh directory and query `/api/v6/plan` for each agency's `smoke_trip`. Assets: `motis-data.tar.zst` (contains `data/`, including `config.yml` and `build-info.json`), its `.sha256`, and `build-info.json`. The routing server only downloads, verifies and swaps this package; `motis server` needs nothing but `data/`. Dataset tags equal agency ids, so MOTIS trip ids read `{date}_{time}_{agency}_{gtfs_trip_id}`.
 
