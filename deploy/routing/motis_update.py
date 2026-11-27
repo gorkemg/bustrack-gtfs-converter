@@ -170,6 +170,14 @@ def smoke_time(tz_name: str, now: datetime) -> datetime:
     return candidate
 
 
+def smoke_times(tz_name: str, now: datetime) -> list[datetime]:
+    """Probe the same three weekday mornings as the CI package check."""
+    times = [smoke_time(tz_name, now)]
+    while len(times) < 3:
+        times.append(smoke_time(tz_name, times[-1]))
+    return times
+
+
 def plan_url(base_url: str, origin: list[float], destination: list[float], when: datetime) -> str:
     query = urllib.parse.urlencode({
         "fromPlace": f"{origin[0]},{origin[1]}",
@@ -460,14 +468,19 @@ def smoke(port: int, info: dict) -> None:
     now = datetime.now(timezone.utc)
     failures = []
     for agency_id, trip in sorted(trips.items()):
-        url = plan_url(f"http://127.0.0.1:{port}", trip["from"], trip["to"], smoke_time(trip["timezone"], now))
-        try:
-            with urllib.request.urlopen(url, timeout=30) as response:
-                error = smoke_error(json.loads(response.read()), agency_id)
-        except (OSError, ValueError) as exc:
-            error = f"{agency_id}: {exc}"
-        if error:
-            failures.append(error)
+        errors = []
+        for when in smoke_times(trip["timezone"], now):
+            url = plan_url(f"http://127.0.0.1:{port}", trip["from"], trip["to"], when)
+            try:
+                with urllib.request.urlopen(url, timeout=30) as response:
+                    error = smoke_error(json.loads(response.read()), agency_id)
+            except (OSError, ValueError) as exc:
+                error = f"{agency_id}: {exc}"
+            if error is None:
+                break
+            errors.append(f"{when.date().isoformat()}: {error}")
+        else:
+            failures.append("; ".join(errors))
     if failures:
         raise RuntimeError("smoke test failed: " + "; ".join(failures))
 
