@@ -7,6 +7,7 @@ import tarfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from scripts import motis_build
 
@@ -93,6 +94,28 @@ class MotisUpdateTests(unittest.TestCase):
             motis_update.smoke_time("America/New_York", now),
             motis_build.next_weekday_morning("America/New_York", now),
         )
+
+    def test_smoke_probes_other_weekdays_after_holiday(self) -> None:
+        now = datetime(2026, 11, 25, 12, tzinfo=timezone.utc)
+        self.assertEqual(motis_update.smoke_times("America/Denver", now),
+                         motis_build.weekday_mornings("America/Denver", now))
+        empty = b'{"itineraries": []}'
+        transit = b'{"itineraries": [{"legs": [{"mode": "BUS", "tripId": "x_uta_123"}]}]}'
+        info = {"smoke_trips": {"uta": {"from": [1, 2], "to": [3, 4], "timezone": "America/Denver"}}}
+        with mock.patch.object(motis_update, "datetime", wraps=datetime) as clock, \
+             mock.patch.object(motis_update.urllib.request, "urlopen", side_effect=[io.BytesIO(empty), io.BytesIO(transit)]) as request:
+            clock.now.return_value = now
+            motis_update.smoke(8081, info)
+        self.assertEqual(request.call_count, 2)
+        self.assertIn("2026-11-26T15%3A00%3A00Z", request.call_args_list[0].args[0])
+        self.assertIn("2026-11-27T15%3A00%3A00Z", request.call_args_list[1].args[0])
+
+    def test_smoke_rejects_all_failed_days(self) -> None:
+        info = {"smoke_trips": {"uta": {"from": [1, 2], "to": [3, 4], "timezone": "America/Denver"}}}
+        with mock.patch.object(motis_update.urllib.request, "urlopen", side_effect=lambda *a, **k: io.BytesIO(b'{"itineraries": []}')) as request:
+            with self.assertRaisesRegex(RuntimeError, "smoke test failed"):
+                motis_update.smoke(8081, info)
+        self.assertEqual(request.call_count, 3)
 
     def test_build_info_carries_smoke_trips(self) -> None:
         config = motis_build.load_routing_config()
